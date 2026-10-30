@@ -1,9 +1,15 @@
 import { logger } from "../logger";
 import { timingSafeEqual } from "crypto";
+import { validateAgentReplayHeaders } from "./agent-nonce-store";
+import { verifyAgentClientCert } from "./mtls-agent-auth";
 
 let warnedDisableAuthIgnored = false;
 let loggedAuthDisabledByEnv = false;
 let loggedAuthDisabledNoToken = false;
+
+// Whether replay-protection headers are enforced (opt-out for legacy agents).
+const REPLAY_PROTECTION_ENABLED =
+  String(process.env.OVERLORD_AGENT_REPLAY_PROTECTION ?? "true").toLowerCase() !== "false";
 
 function safeCompare(a: string, b: string): boolean {
   const bufA = Buffer.from(a);
@@ -45,5 +51,25 @@ export function isAuthorizedAgentRequest(
   }
 
   const headerToken = req.headers.get("x-agent-token");
-  return headerToken !== null && safeCompare(headerToken, token);
+  if (headerToken === null || !safeCompare(headerToken, token)) {
+    return false;
+  }
+
+  // Replay protection: validate timestamp + nonce (can be disabled for legacy agents).
+  if (REPLAY_PROTECTION_ENABLED) {
+    const replayError = validateAgentReplayHeaders(req);
+    if (replayError) {
+      logger.warn(`[auth] Agent replay check failed: ${replayError}`);
+      return false;
+    }
+  }
+
+  // mTLS: verify client certificate when OVERLORD_MTLS_AGENT_CA is configured.
+  const mtlsError = verifyAgentClientCert(req);
+  if (mtlsError) {
+    logger.warn(`[auth] ${mtlsError}`);
+    return false;
+  }
+
+  return true;
 }

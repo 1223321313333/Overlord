@@ -44,6 +44,8 @@ export type BuildConfig = {
   requireAdmin?: boolean;
   outputExtension?: string;
   sleepSeconds?: number;
+  sleepJitterSeconds?: number;
+  randomizeOutputName?: boolean;
   solMemo?: boolean;
   solAddress?: string;
   solRpcEndpoints?: string;

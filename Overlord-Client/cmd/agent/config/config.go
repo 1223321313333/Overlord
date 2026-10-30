@@ -37,6 +37,7 @@ var DefaultCriticalProcess = "false"
 var DefaultFetchPublicIP = "false"
 var DefaultSecureLogPublicKey = ""
 var DefaultTLSSPKIPins = ""
+var DefaultDnsTxtDomain = ""
 
 const settingsFile = "config/settings.json"
 const serverIndexFile = "config/server_index.json"
@@ -79,6 +80,7 @@ type Config struct {
 	BuildTag              string
 	SleepSeconds          int
 	FetchPublicIP         bool
+	DnsTxtDomain          string
 }
 
 func Load() Config {
@@ -233,6 +235,7 @@ func Load() Config {
 		BuildTag:              strings.TrimSpace(DefaultBuildTag),
 		SleepSeconds:          parseSleepSeconds(DefaultSleepSeconds),
 		FetchPublicIP:         fetchPublicIP,
+		DnsTxtDomain:          firstNonEmpty(strings.TrimSpace(overlordenv.Getenv("OVERLORD_DNS_TXT_DOMAIN")), strings.TrimSpace(DefaultDnsTxtDomain)),
 	}
 }
 

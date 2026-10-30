@@ -44,7 +44,15 @@ type Manifest = {
 const ANDROID_NDK_VERSION = "r27c";
 
 function ndkHostTriple(): string {
+  if (process.platform === "win32") return "windows-x86_64";
+  if (process.platform === "darwin") return process.arch === "arm64" ? "darwin-arm64" : "darwin-x86_64";
   return process.arch === "arm64" ? "linux-aarch64" : "linux-x86_64";
+}
+
+function ndkUrl(): string {
+  if (process.platform === "win32") return `https://dl.google.com/android/repository/android-ndk-${ANDROID_NDK_VERSION}-windows.zip`;
+  if (process.platform === "darwin") return `https://dl.google.com/android/repository/android-ndk-${ANDROID_NDK_VERSION}-darwin.zip`;
+  return `https://dl.google.com/android/repository/android-ndk-${ANDROID_NDK_VERSION}-linux.zip`;
 }
 
 function ldidArch(): string {
@@ -126,11 +134,11 @@ const MANIFESTS: Record<ToolchainKey, Manifest> = {
   },
   "android-ndk": {
     displayName: `Android NDK ${ANDROID_NDK_VERSION}`,
-    url: `https://dl.google.com/android/repository/android-ndk-${ANDROID_NDK_VERSION}-linux.zip`,
+    url: ndkUrl(),
     approxSizeMB: 1500,
     archive: "zip",
     binSubdir: `android-ndk-${ANDROID_NDK_VERSION}/toolchains/llvm/prebuilt/${ndkHostTriple()}/bin`,
-    arBasename: "llvm-ar",
+    arBasename: process.platform === "win32" ? "llvm-ar.exe" : "llvm-ar",
   },
   ldid: {
     displayName: "ldid (iOS pseudo-signing)",

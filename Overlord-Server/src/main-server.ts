@@ -61,6 +61,8 @@ import { startBuildProcess as runBuildProcess } from "./server/build-process";
 import { createHttpFetchHandler } from "./server/http-dispatch";
 import { createHonoRouteHandler } from "./server/hono-router";
 import { startMaintenanceLoops } from "./server/maintenance-loops";
+import { handlePollRoutes } from "./server/routes/poll-routes";
+import { handleDeadDropRoutes } from "./server/routes/dead-drop-routes";
 import {
   deliverNotificationWithScreenshot,
   storeNotificationScreenshot,
@@ -790,6 +792,8 @@ async function startServer() {
         (req, url, srv) => handleClientRoutes(req, url, srv as any, routeDeps.client),
         (req, url, srv) => handleWsUpgradeRoutes(req, url, srv as any, routeDeps.wsUpgrade),
         (req, url) => handleRemoteDesktopRecordingRoutes(req, url, routeDeps.rdRecording),
+        (req, url) => handlePollRoutes(req, url),
+        (req, url) => handleDeadDropRoutes(req, url),
       ],
     }),
     websocket: createWebSocketRuntime({
