@@ -70,6 +70,7 @@ func runClient(cfg config.Config) {
 	var loggedTLS bool
 	var lastDisconnect time.Time
 	var lastSolRefresh time.Time
+	var lastHealthySessionEnd time.Time
 	solInitialWait := 2*time.Minute + time.Duration(mrand.Intn(60))*time.Second
 	solRefreshInterval := 5*time.Minute + time.Duration(mrand.Intn(300))*time.Second
 
@@ -114,7 +115,14 @@ func runClient(cfg config.Config) {
 			}
 			rotateToNextServer(&currentIndex, cfg.ServerURLs)
 
-			obfSleepDuration(backoff)
+			// After a healthy session recently ended (e.g. IP change), stay in
+			// fast-retry mode for 45 s so the agent reconnects as soon as the
+			// new network is ready instead of waiting the full base backoff.
+			if !lastHealthySessionEnd.IsZero() && time.Since(lastHealthySessionEnd) < 45*time.Second {
+				obfSleepDuration(reconnectDelay())
+			} else {
+				obfSleepDuration(backoff)
+			}
 			backoff = exponentialBackoff(baseBackoff, backoff, 5*time.Minute, consecutiveFailures)
 			cancel()
 			continue
@@ -164,6 +172,7 @@ func runClient(cfg config.Config) {
 			if sessionAge >= 60*time.Second {
 				consecutiveFailures = 0
 				backoff = baseBackoff
+				lastHealthySessionEnd = time.Now()
 				log.Printf("session ended after %s: %v (healthy session — immediate retry)", sessionAge.Round(time.Second), err)
 			} else {
 				log.Printf("session ended after %s: %v (retrying in %s)", sessionAge.Round(time.Second), err, backoff)
@@ -870,6 +879,7 @@ func runSession(ctx context.Context, cancel context.CancelFunc, conn *websocket.
 			if grace < 60*time.Second {
 				grace = 60 * time.Second
 			}
+			start := time.Now()
 			ticker := time.NewTicker(interval)
 			defer ticker.Stop()
 			for {
@@ -878,7 +888,12 @@ func runSession(ctx context.Context, cancel context.CancelFunc, conn *websocket.
 					return
 				case <-ticker.C:
 					last := env.LastPong()
-					if !last.IsZero() && time.Since(last) > grace {
+					// Fire if: last pong is stale, OR no pong ever arrived but
+					// the connection has been open longer than grace (handles the
+					// case where IP changes before the first pong is received).
+					stale := (!last.IsZero() && time.Since(last) > grace) ||
+						(last.IsZero() && time.Since(start) > grace)
+					if stale {
 						log.Printf("ping: no pong for %s, forcing reconnect", time.Since(last))
 						cancel()
 						conn.CloseNow()
