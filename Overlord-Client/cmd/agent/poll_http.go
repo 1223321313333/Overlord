@@ -16,6 +16,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	mrand "math/rand"
 	"net/http"
 	"strings"
 	"sync"
@@ -30,8 +31,15 @@ import (
 	rt "overlord-client/cmd/agent/runtime"
 )
 
-// pollInterval is how often the agent polls for new tasks.
+// pollInterval is the base poll interval; actual interval is jittered ±30%.
 const pollInterval = 5 * time.Second
+
+// jitteredPollInterval returns a duration in [base*0.7, base*1.3].
+func jitteredPollInterval() time.Duration {
+	base := int64(pollInterval)
+	jitter := base * 3 / 10
+	return time.Duration(base - jitter + mrand.Int63n(jitter*2+1))
+}
 
 // pollCommand mirrors the JSON shape returned by GET /api/poll/:id/tasks.
 type pollCommand struct {
@@ -153,10 +161,11 @@ func runPollClient(cfg config.Config) {
 	backoff := pollInterval
 	consecutiveErrs := 0
 
-	ticker := time.NewTicker(pollInterval)
+	ticker := time.NewTicker(jitteredPollInterval())
 	defer ticker.Stop()
 
 	for range ticker.C {
+		ticker.Reset(jitteredPollInterval())
 		commands, err := pollFetchTasks(httpClient, baseURL, clientID, token)
 		if err != nil {
 			consecutiveErrs++
@@ -176,7 +185,6 @@ func runPollClient(cfg config.Config) {
 		if consecutiveErrs > 0 {
 			consecutiveErrs = 0
 			backoff = pollInterval
-			ticker.Reset(backoff)
 		}
 
 		if len(commands) == 0 {

