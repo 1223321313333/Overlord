@@ -999,6 +999,7 @@ function applyFormSettings(settings) {
 
   updateWindowsSectionVisibility();
   updateIosSectionVisibility();
+  updateAndroidApkVisibility();
   updatePersistenceSettingsVisibility();
   updateShellcodeCheckboxVisibility();
   updateDisableCgoWarning();
@@ -1388,6 +1389,7 @@ function getSelectedPlatformFamilies() {
     linux: selectedPlatforms.some((platform) => platform.startsWith("linux-")),
     darwin: selectedPlatforms.some((platform) => platform.startsWith("darwin-")),
     ios: selectedPlatforms.some((platform) => platform.startsWith("ios-")),
+    android: selectedPlatforms.some((platform) => platform.startsWith("android-")),
   };
 }
 
@@ -1451,6 +1453,7 @@ platformInputs.forEach((input) => {
   input.addEventListener("change", updatePersistenceSettingsVisibility);
   input.addEventListener("change", updateWindowsSectionVisibility);
   input.addEventListener("change", updateIosSectionVisibility);
+  input.addEventListener("change", updateAndroidApkVisibility);
   input.addEventListener("change", updateMacosSdkVisibility);
 });
 
@@ -1471,6 +1474,15 @@ function updateIosSectionVisibility() {
   }
 }
 updateIosSectionVisibility();
+
+function updateAndroidApkVisibility() {
+  const families = getSelectedPlatformFamilies();
+  const apkContainer = document.getElementById("android-apk-container");
+  if (apkContainer) {
+    apkContainer.classList.toggle("hidden", !families.android);
+  }
+}
+updateAndroidApkVisibility();
 
 updatePersistenceSettingsVisibility();
 
