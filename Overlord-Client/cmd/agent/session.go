@@ -69,6 +69,10 @@ func runClient(cfg config.Config) {
 	}
 	currentIndex := cfg.ServerIndex
 	consecutiveFailures := 0
+	// After this many consecutive WS dial failures the agent falls back to
+	// HTTP polling until a WS dial succeeds again.
+	const wsFallbackThreshold = 5
+	inPollFallback := false
 	var loggedTLS bool
 	var lastDisconnect time.Time
 	var lastSolRefresh time.Time
@@ -117,6 +121,22 @@ func runClient(cfg config.Config) {
 			}
 			rotateToNextServer(&currentIndex, cfg.ServerURLs)
 
+			// After enough consecutive WS failures, fall back to HTTP polling
+			// so the agent stays reachable even when WebSocket is blocked.
+			if !inPollFallback && consecutiveFailures >= wsFallbackThreshold {
+				log.Printf("[fallback] %d consecutive WS failures — switching to HTTP poll", consecutiveFailures)
+				inPollFallback = true
+				cancel()
+				runPollClient(cfg)
+				// runPollClient returns when the server requests a reconnect or
+				// an error occurs — try WS again from scratch.
+				log.Printf("[fallback] HTTP poll exited, retrying WebSocket")
+				inPollFallback = false
+				consecutiveFailures = 0
+				backoff = baseBackoff
+				continue
+			}
+
 			// After a healthy session recently ended (e.g. IP change), stay in
 			// fast-retry mode for 45 s so the agent reconnects as soon as the
 			// new network is ready instead of waiting the full base backoff.
@@ -132,6 +152,9 @@ func runClient(cfg config.Config) {
 			cancel()
 			continue
 		}
+
+		// WS dial succeeded — clear poll fallback state.
+		inPollFallback = false
 
 		if currentIndex != cfg.ServerIndex {
 			if err := config.SaveServerIndex(currentIndex); err != nil {
