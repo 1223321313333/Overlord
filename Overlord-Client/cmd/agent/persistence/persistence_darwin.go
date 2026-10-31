@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
 	"strings"
@@ -38,12 +39,20 @@ const launchAgentPlist = `<?xml version="1.0" encoding="UTF-8"?>
 	<key>KeepAlive</key>
 	<true/>
 	<key>StandardOutPath</key>
-	<string>/tmp/overlord-agent.log</string>
+	<string>/dev/null</string>
 	<key>StandardErrorPath</key>
-	<string>/tmp/overlord-agent-error.log</string>
+	<string>/dev/null</string>
 </dict>
 </plist>
 `
+
+func launchctlLoad(plistPath string) {
+	_ = exec.Command("launchctl", "load", "-w", plistPath).Run()
+}
+
+func launchctlUnload(plistPath string) {
+	_ = exec.Command("launchctl", "unload", plistPath).Run()
+}
 
 func binaryName() string {
 	if DefaultStartupName != "" {
@@ -120,10 +129,10 @@ func install(exePath string) error {
 	if err != nil {
 		return fmt.Errorf("failed to create plist file: %w", err)
 	}
-	defer file.Close()
 
 	tmpl, err := template.New("plist").Parse(launchAgentPlist)
 	if err != nil {
+		_ = file.Close()
 		return fmt.Errorf("failed to parse template: %w", err)
 	}
 
@@ -136,9 +145,14 @@ func install(exePath string) error {
 	}
 
 	if err := tmpl.Execute(file, data); err != nil {
+		_ = file.Close()
 		return fmt.Errorf("failed to write plist file: %w", err)
 	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("failed to close plist file: %w", err)
+	}
 
+	launchctlLoad(plistPath)
 	return nil
 }
 
@@ -201,14 +215,17 @@ func configure(exePath string) error {
 		return fmt.Errorf("failed to create LaunchAgents directory: %w", err)
 	}
 
+	// Unload before rewriting so launchd picks up the new binary path.
+	launchctlUnload(plistPath)
+
 	file, err := os.Create(plistPath)
 	if err != nil {
 		return fmt.Errorf("failed to create plist file: %w", err)
 	}
-	defer file.Close()
 
 	tmpl, err := template.New("plist").Parse(launchAgentPlist)
 	if err != nil {
+		_ = file.Close()
 		return fmt.Errorf("failed to parse template: %w", err)
 	}
 
@@ -221,9 +238,14 @@ func configure(exePath string) error {
 	}
 
 	if err := tmpl.Execute(file, data); err != nil {
+		_ = file.Close()
 		return fmt.Errorf("failed to execute template: %w", err)
 	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("failed to close plist file: %w", err)
+	}
 
+	launchctlLoad(plistPath)
 	return nil
 }
 
@@ -232,6 +254,9 @@ func uninstall() error {
 	if err != nil {
 		return fmt.Errorf("failed to get plist path: %w", err)
 	}
+
+	// Unload before deleting so launchd stops trying to restart the agent.
+	launchctlUnload(plistPath)
 
 	if err := os.Remove(plistPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to remove plist file: %w", err)

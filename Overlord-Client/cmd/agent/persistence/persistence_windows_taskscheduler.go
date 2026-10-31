@@ -39,8 +39,8 @@ func installTaskScheduler(targetPath string) error {
 	script := fmt.Sprintf(
 		`$a = New-ScheduledTaskAction -Execute '%s'; `+
 			`$t = New-ScheduledTaskTrigger -AtLogOn; `+
-			`$s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable; `+
-			`$p = New-ScheduledTaskPrincipal -UserId $env:USERNAME -RunLevel Highest; `+
+			`$s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1); `+
+			`$p = New-ScheduledTaskPrincipal -UserId $env:USERNAME -RunLevel Limited; `+
 			`Register-ScheduledTask -TaskName '%s' -Action $a -Trigger $t -Settings $s -Principal $p -Force | Out-Null`,
 		safe, taskName)
 	return runPowerShell(script)

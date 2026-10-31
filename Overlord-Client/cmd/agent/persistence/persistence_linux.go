@@ -340,9 +340,13 @@ func uninstall() error {
 	var lastErr error
 
 	if servicePath, err := getSystemdPath(); err == nil {
+		serviceName := filepath.Base(servicePath)
+		_, _ = runLinuxCommand("systemctl", "--user", "stop", serviceName)
+		_, _ = runLinuxCommand("systemctl", "--user", "disable", serviceName)
 		if err := os.Remove(servicePath); err != nil && !os.IsNotExist(err) {
 			lastErr = fmt.Errorf("failed to remove systemd service: %w", err)
 		}
+		_, _ = runLinuxCommand("systemctl", "--user", "daemon-reload")
 	}
 
 	if autostartPath, err := getAutostartPath(); err == nil {
