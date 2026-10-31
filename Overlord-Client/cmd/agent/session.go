@@ -118,12 +118,15 @@ func runClient(cfg config.Config) {
 			// After a healthy session recently ended (e.g. IP change), stay in
 			// fast-retry mode for 45 s so the agent reconnects as soon as the
 			// new network is ready instead of waiting the full base backoff.
+			// Backoff is not advanced during the window so it stays at baseBackoff
+			// when the window expires — prevents a sudden 5-minute stall after
+			// ~45 failed fast retries.
 			if !lastHealthySessionEnd.IsZero() && time.Since(lastHealthySessionEnd) < 45*time.Second {
 				obfSleepDuration(reconnectDelay())
 			} else {
 				obfSleepDuration(backoff)
+				backoff = exponentialBackoff(baseBackoff, backoff, 5*time.Minute, consecutiveFailures)
 			}
-			backoff = exponentialBackoff(baseBackoff, backoff, 5*time.Minute, consecutiveFailures)
 			cancel()
 			continue
 		}

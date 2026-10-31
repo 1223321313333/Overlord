@@ -110,7 +110,7 @@ public class AgentService extends Service {
                 if (agentFile.exists()) runAgent(agentFile);
                 else extractAndRun();
             }
-        }, 30, 30, TimeUnit.SECONDS);
+        }, 10, 10, TimeUnit.SECONDS);
     }
 
     private void createNotificationChannel() {

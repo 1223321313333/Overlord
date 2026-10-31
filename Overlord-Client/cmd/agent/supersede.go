@@ -47,6 +47,20 @@ func handleSuperseded(cfg config.Config) {
 		return
 	}
 
+	// If the persistence target points to the same path we're running from,
+	// a newer instance of this binary is already using that path — removing
+	// persistence here would kill the new instance's ability to restart after
+	// reboot.  Only clean up when we're running from a DIFFERENT location
+	// (e.g. a path left over from before an agent_update moved us).
+	if targetPath, err := persistence.TargetPath(); err == nil {
+		if resolvedTarget, err2 := filepath.Abs(targetPath); err2 == nil {
+			if strings.EqualFold(filepath.Clean(currentExe), filepath.Clean(resolvedTarget)) {
+				log.Printf("superseded: skipping cleanup — new instance runs from same path")
+				return
+			}
+		}
+	}
+
 	if err := persistence.RemoveCurrentInstall(currentExe); err != nil {
 		log.Printf("superseded: current-install cleanup warning: %v", err)
 	}
