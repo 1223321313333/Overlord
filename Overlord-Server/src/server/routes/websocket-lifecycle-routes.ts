@@ -852,16 +852,10 @@ export async function handleWebSocketMessage(
         if (buildTag && isRevoked) {
           const shortId = resolvedBuildId ? resolvedBuildId.substring(0, 8) : "<unknown>";
           logger.info(`[build-block] rejecting agent ${resolvedId} from revoked build ${shortId}`);
-          try {
-            ws.send(
-              encodeMessage({
-                type: "command",
-                commandType: "disconnect",
-                id: crypto.randomUUID(),
-                payload: { reason: "build_blocked" },
-              }),
-            );
-          } catch {}
+          // Don't send a disconnect command here — it causes the agent to
+          // os.Exit(0) and restart immediately, creating a tight loop that
+          // can trip systemd's restart rate-limit. Closing with 4007 lets
+          // the agent see the close code and back off for 5 minutes.
           rejectEnrollment(ws);
           try { ws.close(4007, "build_blocked"); } catch {}
           return;

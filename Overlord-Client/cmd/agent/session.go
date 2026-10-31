@@ -527,7 +527,12 @@ func shouldRetryImmediately(err error) bool {
 	}
 	var closeErr *websocket.CloseError
 	if errors.As(err, &closeErr) {
-		if closeErr.Code == 4001 || closeErr.Code == 4002 || closeErr.Code == 4003 || closeErr.Code == supersededCloseCode {
+		// 4001 "ping timeout" means the server's liveness check expired on an
+		// authenticated session — the connection is already dead, retry at once.
+		if closeErr.Code == 4001 && closeErr.Reason == "ping timeout" {
+			return true
+		}
+		if closeErr.Code == 4001 || closeErr.Code == 4002 || closeErr.Code == 4003 || closeErr.Code == 4007 || closeErr.Code == supersededCloseCode {
 			return false
 		}
 		if closeErr.Code == websocket.StatusNormalClosure || closeErr.Code == websocket.StatusGoingAway {
@@ -563,11 +568,19 @@ func enrollmentRetryDelay(err error) time.Duration {
 	var closeErr *websocket.CloseError
 	if errors.As(err, &closeErr) {
 		switch closeErr.Code {
-		case 4001: // pending
+		case 4001:
+			// Server uses 4001 for two different situations:
+			// - purgatory "pending": enrollment not yet approved → wait before retrying
+			// - liveness timeout "ping timeout": authenticated session timed out → reconnect normally
+			if closeErr.Reason == "ping timeout" {
+				return 0
+			}
 			return getEnrollmentRetryInterval()
 		case 4002: // invalid signature
 			return 60 * time.Second
 		case 4003: // denied
+			return 5 * time.Minute
+		case 4007: // build_blocked
 			return 5 * time.Minute
 		}
 	}
