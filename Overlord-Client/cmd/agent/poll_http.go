@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -147,20 +148,43 @@ func runPollClient(cfg config.Config) {
 	}
 
 	ctx := context.Background()
+
+	const maxBackoff = 5 * time.Minute
+	backoff := pollInterval
+	consecutiveErrs := 0
+
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
 	for range ticker.C {
 		commands, err := pollFetchTasks(httpClient, baseURL, clientID, token)
 		if err != nil {
-			log.Printf("[poll] fetch tasks failed: %v", err)
+			consecutiveErrs++
+			log.Printf("[poll] fetch tasks failed (err #%d): %v", consecutiveErrs, err)
+			// Exponential backoff: double every 3 consecutive failures, cap at 5 min.
+			if consecutiveErrs%3 == 0 {
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+				log.Printf("[poll] backing off to %s", backoff)
+				ticker.Reset(backoff)
+			}
 			continue
 		}
+		// Successful fetch: reset backoff.
+		if consecutiveErrs > 0 {
+			consecutiveErrs = 0
+			backoff = pollInterval
+			ticker.Reset(backoff)
+		}
+
 		if len(commands) == 0 {
 			continue
 		}
 		log.Printf("[poll] got %d command(s)", len(commands))
 
+		reconnect := false
 		for _, cmd := range commands {
 			envelope := map[string]interface{}{
 				"type":        "command",
@@ -169,6 +193,13 @@ func runPollClient(cfg config.Config) {
 				"payload":     cmd.Payload,
 			}
 			if err := dispatcher.Dispatch(ctx, envelope); err != nil {
+				if errors.Is(err, handlers.ErrReconnect) {
+					// Server requested a reconnect; exit the poll loop so runClient
+					// can restart the session (re-entering poll or WS mode).
+					log.Printf("[poll] reconnect requested, restarting session")
+					reconnect = true
+					break
+				}
 				log.Printf("[poll] dispatch error for %s/%s: %v", cmd.CommandType, cmd.ID, err)
 			}
 		}
@@ -179,6 +210,10 @@ func runPollClient(cfg config.Config) {
 			if err := pollPostResult(httpClient, baseURL, clientID, token, r); err != nil {
 				log.Printf("[poll] post result failed for %s: %v", r.ID, err)
 			}
+		}
+
+		if reconnect {
+			return
 		}
 	}
 }
