@@ -885,15 +885,20 @@ func runSession(ctx context.Context, cancel context.CancelFunc, conn *websocket.
 			}
 		})
 		goSafe("pong watchdog", cancel, func() {
-			// Wait at most 2 ping intervals before declaring the connection dead.
-			// interval×3+30 s was too slow to detect silent drops; 2× is still
-			// generous enough for high-latency links while recovering faster.
-			grace := interval * 2
-			if grace < 60*time.Second {
-				grace = 60 * time.Second
+			// The server sends pings every 15 s regardless of our own ping
+			// interval, so LastPong refreshes every 15 s in a healthy session.
+			// Poll at the same rate so we can fire as soon as one full grace
+			// window passes without an update.  Grace = agent_interval + 15 s
+			// (≥45 s), which is generous for any real-world link while still
+			// detecting silent drops ~45 s after they occur instead of ~90 s.
+			const serverPingInterval = 15 * time.Second
+			tickInterval := serverPingInterval
+			grace := interval + serverPingInterval
+			if grace < 45*time.Second {
+				grace = 45 * time.Second
 			}
 			start := time.Now()
-			ticker := time.NewTicker(interval)
+			ticker := time.NewTicker(tickInterval)
 			defer ticker.Stop()
 			for {
 				select {
@@ -904,8 +909,8 @@ func runSession(ctx context.Context, cancel context.CancelFunc, conn *websocket.
 					// Fire if: last pong is stale, OR no pong ever arrived but
 					// the connection has been open longer than grace (handles the
 					// case where IP changes before the first pong is received).
-					stale := (!last.IsZero() && time.Since(last) > grace) ||
-						(last.IsZero() && time.Since(start) > grace)
+					stale := (!last.IsZero() && time.Since(last) >= grace) ||
+						(last.IsZero() && time.Since(start) >= grace)
 					if stale {
 						log.Printf("ping: no pong for %s, forcing reconnect", time.Since(last))
 						cancel()
