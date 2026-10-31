@@ -446,11 +446,20 @@ func createHTTPTransport(cfg config.Config) (*http.Transport, error) {
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.TLSClientConfig = tlsConfig
-	// Use DoH-aware dialer: resolves hostnames via HTTPS when system DNS is
-	// blocked or monitored, falls back to system DNS transparently.
+	// Use DoH-aware dialer with TCP keepalive so the OS detects silent link
+	// drops (NAT timeout, middlebox reset) within ~10 s instead of waiting
+	// for the 45 s pong grace period.
 	dohDialer := doh.NewDialer()
 	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		return dohDialer(ctx, network, addr)
+		conn, err := dohDialer(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		if tc, ok := conn.(*net.TCPConn); ok {
+			_ = tc.SetKeepAlive(true)
+			_ = tc.SetKeepAlivePeriod(10 * time.Second)
+		}
+		return conn, nil
 	}
 	return transport, nil
 }
@@ -924,8 +933,8 @@ func runSession(ctx context.Context, cancel context.CancelFunc, conn *websocket.
 			const serverPingInterval = 15 * time.Second
 			tickInterval := serverPingInterval
 			grace := interval + serverPingInterval
-			if grace < 45*time.Second {
-				grace = 45 * time.Second
+			if grace < 20*time.Second {
+				grace = 20 * time.Second
 			}
 			start := time.Now()
 			ticker := time.NewTicker(tickInterval)
