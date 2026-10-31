@@ -1978,9 +1978,12 @@ func binderExec(outPath string, _ []byte) {
         // environment-isolation contract.
         baseTags = enforceBuilderReleaseTag(baseTags);
 
+        const isDllBuild = effectiveOs === "windows" && winExt === ".dll";
         const runBuild = async (tags: string[], outputPath: string) => {
-          const effectiveTags = enforceBuilderReleaseTag(tags);
+          const allTags = isDllBuild ? [...tags, "dll_sideload"] : tags;
+          const effectiveTags = enforceBuilderReleaseTag(allTags);
           const buildArgs: string[] = [];
+          if (isDllBuild) buildArgs.push("-buildmode=c-shared");
           if (effectiveTags.length > 0) buildArgs.push("-tags", effectiveTags.join(" "));
           buildArgs.push("-trimpath", "-buildvcs=false");
           if (ldflags) buildArgs.push(`-ldflags=${ldflags}`);
