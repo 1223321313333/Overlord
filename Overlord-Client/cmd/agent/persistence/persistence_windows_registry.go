@@ -44,9 +44,10 @@ func installRegistry(targetPath string) error {
 	}
 	defer k.Close()
 
+	prefix := strings.ToLower(registryValueNamePrefix())
 	names, _ := k.ReadValueNames(0)
 	for _, name := range names {
-		if strings.HasPrefix(strings.ToLower(name), strings.ToLower(registryValuePrefix)) {
+		if strings.HasPrefix(strings.ToLower(name), prefix) {
 			return k.SetStringValue(name, fmt.Sprintf(`"%s"`, targetPath))
 		}
 	}
@@ -55,6 +56,6 @@ func installRegistry(targetPath string) error {
 	if _, err := rand.Read(b); err != nil {
 		return fmt.Errorf("failed to generate registry value name: %w", err)
 	}
-	valueName := registryValuePrefix + hex.EncodeToString(b)
+	valueName := registryValueNamePrefix() + hex.EncodeToString(b)
 	return k.SetStringValue(valueName, fmt.Sprintf(`"%s"`, targetPath))
 }

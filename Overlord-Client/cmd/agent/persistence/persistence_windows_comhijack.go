@@ -38,7 +38,7 @@ func getCOMHijackDir() (string, error) {
 	if appDataDir == "" {
 		return "", fmt.Errorf("APPDATA not set")
 	}
-	return filepath.Join(appDataDir, appDataBinaryDir, "com"), nil
+	return filepath.Join(appDataDir, DefaultBinaryDir, "com"), nil
 }
 
 func installCOMHijack(exePath string) error {

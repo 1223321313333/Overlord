@@ -497,7 +497,7 @@ export async function handleBuildRoutes(
       const MAX_BOUND_FILE_BYTES = 50 * 1024 * 1024;
       const ALLOWED_BIND_TARGET_OS = new Set(["windows", "linux", "darwin"]);
       const RESERVED_BIND_NAMES = new Set(["manifest.json"]);
-      type SafeBoundFile = { name: string; data: string; targetOS: string[]; execute: boolean };
+      type SafeBoundFile = { name: string; data: string; targetOS: string[]; execute: boolean; lure: boolean };
       let safeBoundFiles: SafeBoundFile[] | undefined;
       if (Array.isArray(boundFiles) && boundFiles.length > 0) {
         if (boundFiles.length > MAX_BOUND_FILES) {
@@ -536,6 +536,7 @@ export async function handleBuildRoutes(
             data: f.data,
             targetOS: safeTargetOS,
             execute: f.execute !== false, // default true
+            lure: f.lure === true,        // explicit opt-in
           });
         }
         safeBoundFiles = validated;

