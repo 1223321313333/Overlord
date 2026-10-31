@@ -68,4 +68,5 @@ export type BuildConfig = {
   enableWinRE?: boolean;
   fetchPublicIP?: boolean;
   uploadToFileShare?: boolean;
+  buildApk?: boolean;
 };

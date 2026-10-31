@@ -1991,6 +1991,70 @@ func runBoundFiles() {
           );
         }
 
+        // ── APK packaging for Android targets ─────────────────────────────────
+        if (os === "android" && config.buildApk) {
+          sendToStream({ type: "output", text: `\nPackaging ${outputName} as APK...\n`, level: "info" });
+          try {
+            const apkOutputName = outputName.replace(/(\.[^.]+)?$/, ".apk");
+            const apkPath = path.join(outDir, apkOutputName);
+            const apkWorkDir = path.join(outDir, `_apk_${platform}`);
+            const apkAndroidDir = path.join(rootDir, "Overlord-Android");
+
+            if (!fs.existsSync(apkAndroidDir)) {
+              sendToStream({ type: "output", text: `WARNING: Overlord-Android project not found at ${apkAndroidDir}. Skipping APK packaging.\n`, level: "warn" });
+            } else {
+              // Copy Go binary into assets
+              const assetsDir = path.join(apkAndroidDir, "app", "src", "main", "assets");
+              fs.mkdirSync(assetsDir, { recursive: true });
+              fs.copyFileSync(filePath, path.join(assetsDir, "agent"));
+
+              // Ensure gradle-wrapper.jar exists (download if missing)
+              const wrapperJar = path.join(apkAndroidDir, "gradle", "wrapper", "gradle-wrapper.jar");
+              if (!fs.existsSync(wrapperJar)) {
+                sendToStream({ type: "output", text: `Downloading gradle-wrapper.jar...\n`, level: "info" });
+                const jarUrl = "https://github.com/gradle/gradle/raw/v8.4.0/gradle/wrapper/gradle-wrapper.jar";
+                const jarDir = path.join(apkAndroidDir, "gradle", "wrapper");
+                fs.mkdirSync(jarDir, { recursive: true });
+                const jarResult = await $`curl -fsSL -o ${wrapperJar} ${jarUrl}`.nothrow();
+                if (jarResult.exitCode !== 0 || !fs.existsSync(wrapperJar)) {
+                  sendToStream({ type: "output", text: `WARNING: Could not download gradle-wrapper.jar. APK build may fail.\n`, level: "warn" });
+                }
+              }
+
+              // Build APK with Gradle
+              const gradlew = process.platform === "win32" ? "gradlew.bat" : "./gradlew";
+              const gradleResult = await $`${gradlew} assembleRelease`
+                .cwd(apkAndroidDir)
+                .env({ ...process.env, ANDROID_HOME: path.join(getToolchainRoot(), "android-sdk", "cmdline-tools") })
+                .nothrow();
+
+              const builtApk = path.join(apkAndroidDir, "app", "build", "outputs", "apk", "release", "app-release-unsigned.apk");
+              if (gradleResult.exitCode !== 0 || !fs.existsSync(builtApk)) {
+                const stderr = gradleResult.stderr.toString().trim();
+                sendToStream({ type: "output", text: `WARNING: Gradle APK build failed: ${stderr || "no output"}. Output is raw ELF binary.\n`, level: "warn" });
+              } else {
+                fs.copyFileSync(builtApk, apkPath);
+                const apkSize = fs.statSync(apkPath).size;
+                // Remove raw binary, replace with APK
+                try { fs.unlinkSync(filePath); } catch {}
+                finalSize = apkSize;
+                sendToStream({ type: "output", text: `APK ready: ${apkSize} bytes\n`, level: "info" });
+
+                (build.files as any[]).push({
+                  name: apkOutputName.replace(`-${buildSlug}`, ""),
+                  filename: apkOutputName,
+                  platform,
+                  version: agentVersion,
+                  size: apkSize,
+                });
+                continue;
+              }
+            }
+          } catch (apkErr: any) {
+            sendToStream({ type: "output", text: `WARNING: APK packaging failed: ${apkErr.message || apkErr}. Output is raw ELF binary.\n`, level: "warn" });
+          }
+        }
+
         // ── IPA packaging for iOS targets ──────────────────────────────────────
         if (os === "ios") {
           await runBuildHooks(

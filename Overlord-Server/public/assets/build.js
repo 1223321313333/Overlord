@@ -888,6 +888,7 @@ function collectFormSettings() {
     shellcodeConsole: document.getElementById("shellcode-console")?.checked ?? false,
     useSgn: document.getElementById("sgn-mode")?.checked ?? false,
     sgnIterations: parseInt(document.getElementById("sgn-iterations")?.value, 10) || 1,
+    buildApk: document.querySelector('input[name="build-apk"]')?.checked ?? false,
     buildPlugins: collectBuildPluginSettings(),
   };
 }
@@ -982,6 +983,7 @@ function applyFormSettings(settings) {
     if (settings.useSgn) applySgnMode(true);
   }
   if (settings.sgnIterations !== undefined) setVal("sgn-iterations", settings.sgnIterations);
+  if (settings.buildApk !== undefined) setCb('input[name="build-apk"]', settings.buildApk);
   if (settings.buildPlugins !== undefined) applyBuildPluginSettings(settings.buildPlugins);
 
   const restoredObfuscate = document.querySelector('input[name="obfuscate"]');

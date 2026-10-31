@@ -13,6 +13,7 @@ export type ToolchainKey =
   | "linux-musl-arm64"
   | "linux-musl-armv7"
   | "android-ndk"
+  | "android-sdk"
   | "ldid"
   | "upx"
   | "rust";
@@ -139,6 +140,14 @@ const MANIFESTS: Record<ToolchainKey, Manifest> = {
     archive: "zip",
     binSubdir: `android-ndk-${ANDROID_NDK_VERSION}/toolchains/llvm/prebuilt/${ndkHostTriple()}/bin`,
     arBasename: process.platform === "win32" ? "llvm-ar.exe" : "llvm-ar",
+  },
+  "android-sdk": {
+    displayName: "Android SDK command-line tools",
+    url: "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip",
+    approxSizeMB: 150,
+    archive: "zip",
+    binSubdir: "cmdline-tools/bin",
+    binaryFilename: "sdkmanager",
   },
   ldid: {
     displayName: "ldid (iOS pseudo-signing)",

