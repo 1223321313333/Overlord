@@ -77,12 +77,12 @@ func configuredH264Bitrate() int {
 
 func automaticH264Bitrate(width, height, fps int) int {
 	pixelsPerSecond := float64(width * height * fps)
-	bitrate := int(pixelsPerSecond * 0.08)
-	if bitrate < 1_500_000 {
-		return 1_500_000
+	bitrate := int(pixelsPerSecond * 0.12)
+	if bitrate < 2_000_000 {
+		return 2_000_000
 	}
-	if bitrate > 18_000_000 {
-		return 18_000_000
+	if bitrate > 25_000_000 {
+		return 25_000_000
 	}
 	return bitrate
 }

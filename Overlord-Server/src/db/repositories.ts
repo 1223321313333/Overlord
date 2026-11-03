@@ -9,6 +9,7 @@ export * from "./repositories/oidc";
 export * from "./repositories/revoked-tokens";
 export * from "./repositories/sessions";
 export * from "./repositories/shared-files";
+export * from "./repositories/socks5-proxies";
 
 export type ClientDbRow = Omit<Partial<ClientInfo>, "online"> & {
   id: string;

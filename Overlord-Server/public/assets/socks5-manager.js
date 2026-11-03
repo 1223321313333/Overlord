@@ -8,6 +8,8 @@ const addProxyBtn = document.getElementById("addProxyBtn");
 const addProxyModal = document.getElementById("addProxyModal");
 const modalClientSelect = document.getElementById("modalClientSelect");
 const modalPortInput = document.getElementById("modalPortInput");
+const modalUsernameInput = document.getElementById("modalUsernameInput");
+const modalPasswordInput = document.getElementById("modalPasswordInput");
 const modalCancelBtn = document.getElementById("modalCancelBtn");
 const modalAddBtn = document.getElementById("modalAddBtn");
 
@@ -49,7 +51,21 @@ function formatTime(ts) {
   return d.toLocaleString();
 }
 
-function renderTable(proxies) {
+function formatBytes(n) {
+  if (!n) return "0 B";
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + " MB";
+  return (n / (1024 * 1024 * 1024)).toFixed(2) + " GB";
+}
+
+function clientLabel(clientMap, clientId) {
+  const c = clientMap?.get(clientId);
+  if (!c) return clientId;
+  return [c.nickname, c.host, c.user].filter(Boolean).join(" · ") || clientId;
+}
+
+function renderTable(proxies, clientMap) {
   if (!proxies.length) {
     tableBody.innerHTML = `
       <tr>
@@ -71,11 +87,20 @@ function renderTable(proxies) {
       <td class="px-4 py-3">
         <div class="flex items-center gap-2">
           <i class="fa-solid fa-desktop text-slate-400"></i>
-          <span class="font-mono text-sm">${escapeHtml(p.clientId)}</span>
+          <div>
+            <div class="text-sm">${escapeHtml(clientLabel(clientMap, p.clientId))}</div>
+            <div class="text-xs text-slate-500 font-mono">${escapeHtml(p.clientId)}</div>
+          </div>
         </div>
       </td>
       <td class="px-4 py-3">
-        <span class="font-mono text-blue-300 font-semibold">${p.port}</span>
+        <div class="flex items-center gap-2">
+          <span class="font-mono text-blue-300 font-semibold">${p.port}</span>
+          ${p.hasAuth ? '<i class="fa-solid fa-lock text-xs text-yellow-400" title="Password protected"></i>' : ""}
+          <button class="copy-btn text-slate-500 hover:text-slate-200 transition-colors" data-copy="socks5://${location.hostname}:${p.port}" title="Copy address">
+            <i class="fa-solid fa-copy text-xs"></i>
+          </button>
+        </div>
       </td>
       <td class="px-4 py-3">
         <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium bg-green-500/20 text-green-400 border border-green-500/30">
@@ -84,8 +109,8 @@ function renderTable(proxies) {
         </span>
       </td>
       <td class="px-4 py-3 text-slate-300">${p.connections}</td>
-      <td class="px-4 py-3">
-        <code class="text-xs text-slate-400 bg-slate-800 px-2 py-1 rounded">socks5://&lt;server&gt;:${p.port}</code>
+      <td class="px-4 py-3 text-slate-400 text-xs">
+        <span title="↑ to client / ↓ from client">↑${formatBytes(p.bytesToClient)} ↓${formatBytes(p.bytesFromClient)}</span>
       </td>
       <td class="px-4 py-3 text-slate-400 text-xs">${formatTime(p.createdAt)}</td>
       <td class="px-4 py-3 text-right">
@@ -107,6 +132,15 @@ function renderTable(proxies) {
       stopProxy(port);
     });
   });
+
+  // wire up copy buttons
+  tableBody.querySelectorAll(".copy-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      navigator.clipboard.writeText(btn.dataset.copy).then(() => {
+        if (toast) toast("Address copied!", "success");
+      });
+    });
+  });
 }
 
 function escapeHtml(str) {
@@ -117,12 +151,14 @@ function escapeHtml(str) {
 
 // ── Actions ───────────────────────────────────────────────────────────────────
 
-async function startProxy(clientId, port) {
+async function startProxy(clientId, port, username, password) {
   try {
+    const body = { clientId, port };
+    if (username) { body.username = username; body.password = password || ""; }
     const res = await fetch("/api/proxy/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ clientId, port }),
+      body: JSON.stringify(body),
     });
     const data = await res.json();
     if (data.ok) {
@@ -156,8 +192,9 @@ async function stopProxy(port) {
 }
 
 async function refresh() {
-  const proxies = await fetchProxies();
-  renderTable(proxies);
+  const [proxies, clients] = await Promise.all([fetchProxies(), fetchClients()]);
+  const clientMap = new Map(clients.map((c) => [c.id, c]));
+  renderTable(proxies, clientMap);
 }
 
 // ── Modal ─────────────────────────────────────────────────────────────────────
@@ -169,6 +206,8 @@ function showModal() {
 
 function hideModal() {
   addProxyModal.classList.add("hidden");
+  if (modalUsernameInput) modalUsernameInput.value = "";
+  if (modalPasswordInput) modalPasswordInput.value = "";
 }
 
 async function loadClientsForModal() {
@@ -198,6 +237,8 @@ addProxyModal.addEventListener("click", (e) => {
 modalAddBtn.addEventListener("click", () => {
   const clientId = modalClientSelect.value;
   const port = parseInt(modalPortInput.value);
+  const username = modalUsernameInput?.value?.trim() || "";
+  const password = modalPasswordInput?.value || "";
   if (!clientId) {
     if (toast) toast("Select a client", "error");
     return;
@@ -207,7 +248,7 @@ modalAddBtn.addEventListener("click", () => {
     return;
   }
   hideModal();
-  startProxy(clientId, port);
+  startProxy(clientId, port, username, password);
 });
 
 // ── Init ──────────────────────────────────────────────────────────────────────

@@ -43,6 +43,11 @@ func encodeHEVCFrame(img *image.RGBA) ([]byte, error) {
 
 func hevcAvailable() bool {
 	hevcProbeOnce.Do(func() {
+		if hevcD3D11TextureAvailable() {
+			hevcProbeOK = true
+			hevcProbeDetail = hevcD3D11TextureEncoderName() + " HEVC Main profile"
+			return
+		}
 		enc, err := newNativeHEVCEncoder("probe", 1280, 720, 30)
 		if err != nil {
 			hevcProbeDetail = err.Error()

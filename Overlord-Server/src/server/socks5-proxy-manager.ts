@@ -20,6 +20,8 @@ import { v4 as uuidv4 } from "uuid";
 import { encodeMessage } from "../protocol";
 import * as clientManager from "../clientManager";
 import { logger } from "../logger";
+import { timingSafeEqual } from "crypto";
+import { saveSocks5Proxy, deleteSocks5Proxy, listSocks5Proxies } from "../db";
 
 export const SOCKS_PROXY_BIND_HOST = "127.0.0.1";
 export const SOCKS_PROXY_MAX_PENDING_BYTES = 64 * 1024 * 1024;
@@ -63,6 +65,11 @@ export type ProxyEntry = {
   /** active tunnel connections keyed by connectionId */
   connections: Map<string, TunnelConnection>;
   createdAt: number;
+  totalBytesFromClient: number;
+  totalBytesToClient: number;
+  /** optional SOCKS5 username/password authentication */
+  username?: string;
+  password?: string;
 };
 
 type TunnelConnection = {
@@ -75,17 +82,59 @@ type TunnelConnection = {
   /** data destined for the SOCKS client that the kernel buffer rejected; flushed on drain */
   writeQueue: Buffer[];
   writeQueueBytes: number;
+  bytesFromClient: number;
+  bytesToClient: number;
 };
 
 type ProxySocketData = {
   connectionId: string;
   proxyPort: number;
   /** SOCKS5 handshake phase */
-  phase: "greeting" | "request" | "tunneling";
+  phase: "greeting" | "auth" | "request" | "tunneling";
   buffer: Buffer;
   /** Absolute deadline for handshake or agent-connect completion. */
   phaseDeadline: number;
 };
+
+// ── Auth helpers ──────────────────────────────────────────────────────────────
+
+/**
+ * Parses an RFC 1929 sub-negotiation packet.
+ * Returns null if the buffer is too short or the version byte is wrong.
+ */
+export function parseRfc1929Auth(
+  buf: Buffer,
+): { username: string; password: string; consumed: number } | null {
+  if (buf.length < 2 || buf[0] !== 0x01) return null;
+  const ulen = buf[1];
+  if (buf.length < 2 + ulen + 1) return null;
+  const plen = buf[2 + ulen];
+  if (buf.length < 2 + ulen + 1 + plen) return null;
+  return {
+    username: buf.subarray(2, 2 + ulen).toString("utf8"),
+    password: buf.subarray(3 + ulen, 3 + ulen + plen).toString("utf8"),
+    consumed: 3 + ulen + plen,
+  };
+}
+
+/**
+ * Timing-safe credential comparison for SOCKS5 auth.
+ * Both buffers are compared with equal-length fills to avoid length leakage.
+ */
+export function verifyProxyAuth(
+  username: string,
+  password: string,
+  expectedUsername: string,
+  expectedPassword: string,
+): boolean {
+  const uBuf = Buffer.from(username, "utf8");
+  const eBuf = Buffer.from(expectedUsername, "utf8");
+  const pBuf = Buffer.from(password, "utf8");
+  const epBuf = Buffer.from(expectedPassword, "utf8");
+  const uOk = uBuf.length === eBuf.length && timingSafeEqual(uBuf, eBuf);
+  const pOk = pBuf.length === epBuf.length && timingSafeEqual(pBuf, epBuf);
+  return uOk && pOk;
+}
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -99,19 +148,34 @@ export function getActiveProxies(): Array<{
   port: number;
   connections: number;
   createdAt: number;
+  bytesFromClient: number;
+  bytesToClient: number;
+  hasAuth: boolean;
 }> {
   const out: Array<{
     clientId: string;
     port: number;
     connections: number;
     createdAt: number;
+    bytesFromClient: number;
+    bytesToClient: number;
+    hasAuth: boolean;
   }> = [];
   for (const [port, entry] of activeProxies) {
+    let bytesFromClient = entry.totalBytesFromClient;
+    let bytesToClient = entry.totalBytesToClient;
+    for (const tunnel of entry.connections.values()) {
+      bytesFromClient += tunnel.bytesFromClient;
+      bytesToClient += tunnel.bytesToClient;
+    }
     out.push({
       clientId: entry.clientId,
       port,
       connections: entry.connections.size,
       createdAt: entry.createdAt,
+      bytesFromClient,
+      bytesToClient,
+      hasAuth: !!(entry.username),
     });
   }
   return out;
@@ -120,6 +184,9 @@ export function getActiveProxies(): Array<{
 export function startProxy(
   clientId: string,
   port: number,
+  username?: string,
+  password?: string,
+  persist = true,
 ): { ok: boolean; message: string } {
   if (activeProxies.has(port)) {
     return { ok: false, message: `Port ${port} is already in use by another proxy` };
@@ -182,6 +249,8 @@ export function startProxy(
             pendingDataBytes: 0,
             writeQueue: [],
             writeQueueBytes: 0,
+            bytesFromClient: 0,
+            bytesToClient: 0,
           });
           socket.timeout(SOCKS_PROXY_HANDSHAKE_TIMEOUT_SECONDS);
           logger.debug(
@@ -255,11 +324,18 @@ export function startProxy(
       listener,
       connections,
       createdAt: Date.now(),
+      totalBytesFromClient: 0,
+      totalBytesToClient: 0,
+      username: username || undefined,
+      password: password || undefined,
     };
     activeProxies.set(port, entry);
     logger.info(
       `[socks5] proxy started on ${SOCKS_PROXY_BIND_HOST}:${port} for client ${clientId}`,
     );
+    if (persist) {
+      try { saveSocks5Proxy(port, clientId, username, password); } catch {}
+    }
     return { ok: true, message: `Proxy started on ${SOCKS_PROXY_BIND_HOST}:${port}` };
   } catch (err: any) {
     return {
@@ -297,8 +373,19 @@ export function stopProxy(port: number): { ok: boolean; message: string } {
 
   entry.listener.stop(true);
   activeProxies.delete(port);
+  try { deleteSocks5Proxy(port); } catch {}
   logger.info(`[socks5] proxy stopped on port ${port}`);
   return { ok: true, message: `Proxy on port ${port} stopped` };
+}
+
+export function restoreSavedProxiesForClient(clientId: string): void {
+  let saved: ReturnType<typeof listSocks5Proxies>;
+  try { saved = listSocks5Proxies(); } catch { return; }
+  for (const p of saved) {
+    if (p.clientId !== clientId) continue;
+    if (activeProxies.has(p.port)) continue;
+    startProxy(p.clientId, p.port, p.username ?? undefined, p.password ?? undefined, false);
+  }
 }
 
 export function stopAllProxiesForClient(clientId: string): void {
@@ -331,6 +418,8 @@ function closeTunnel(
   reason: string,
 ): void {
   const connectionId = tunnel.socket.data.connectionId;
+  entry.totalBytesFromClient += tunnel.bytesFromClient;
+  entry.totalBytesToClient += tunnel.bytesToClient;
   tunnel.pendingData = [];
   tunnel.pendingDataBytes = 0;
   tunnel.writeQueue = [];
@@ -373,6 +462,7 @@ function writeToTunnelSocket(
   data: Buffer | Uint8Array,
 ): void {
   tunnel.socket.timeout(SOCKS_PROXY_IDLE_TIMEOUT_SECONDS);
+  tunnel.bytesToClient += data.byteLength;
   const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
   if (tunnel.writeQueue.length > 0) {
     const nextBytes = enqueueSocksBuffer(
@@ -450,6 +540,8 @@ export function handleProxyTunnelClose(
     if (entry.clientId !== clientId) continue;
     const tunnel = entry.connections.get(connectionId);
     if (tunnel) {
+      entry.totalBytesFromClient += tunnel.bytesFromClient;
+      entry.totalBytesToClient += tunnel.bytesToClient;
       entry.connections.delete(connectionId);
       try {
         tunnel.socket.end();
@@ -505,7 +597,7 @@ function handleSocksData(
 ) {
   const { connectionId, phase } = socket.data;
   const tunnel = entry.connections.get(connectionId);
-  const waitingForSetup = phase !== "tunneling" || !tunnel?.connected;
+  const waitingForSetup = phase === "greeting" || phase === "auth" || phase === "request" || !tunnel?.connected;
   if (waitingForSetup && Date.now() >= socket.data.phaseDeadline) {
     if (tunnel) closeTunnel(entry, tunnel, "handshake/connect deadline exceeded");
     else socket.end();
@@ -540,6 +632,8 @@ function handleSocksData(
       tunnel.pendingDataBytes = nextBytes;
       return;
     }
+    const tunnel2 = entry.connections.get(connectionId);
+    if (tunnel2) tunnel2.bytesFromClient += incoming.byteLength;
     sendDataToAgent(entry.clientId, connectionId, incoming);
     return;
   }
@@ -568,16 +662,65 @@ function handleSocksData(
     if (buf.length < 2 + nmethods) return;
 
     const methods = buf.subarray(2, 2 + nmethods);
-    if (!methods.includes(0x00)) {
-      socket.write(Buffer.from([0x05, 0xff]));
+    const wantAuth = !!(entry.username);
+
+    if (wantAuth) {
+      if (!methods.includes(0x02)) {
+        // client doesn't support username/password auth
+        socket.write(Buffer.from([0x05, 0xff]));
+        socket.end();
+        entry.connections.delete(connectionId);
+        return;
+      }
+      socket.write(Buffer.from([0x05, 0x02]));
+      socket.data.phase = "auth";
+      socket.data.buffer = buf.subarray(2 + nmethods);
+    } else {
+      if (!methods.includes(0x00)) {
+        socket.write(Buffer.from([0x05, 0xff]));
+        socket.end();
+        entry.connections.delete(connectionId);
+        return;
+      }
+      socket.write(Buffer.from([0x05, 0x00]));
+      socket.data.phase = "request";
+      socket.data.buffer = buf.subarray(2 + nmethods);
+    }
+
+    if (socket.data.buffer.length > 0) {
+      handleSocksData(socket, Buffer.alloc(0), entry);
+    }
+    return;
+  }
+
+  if (phase === "auth") {
+    // RFC 1929 sub-negotiation: VER(0x01) | ULEN | UNAME... | PLEN | PASSWD...
+    if (buf.length < 2) return;
+    if (buf[0] !== 0x01) {
+      socket.write(Buffer.from([0x01, 0x01]));
+      socket.end();
+      entry.connections.delete(connectionId);
+      return;
+    }
+    const ulen = buf[1];
+    if (buf.length < 2 + ulen + 1) return;
+    const plen = buf[2 + ulen];
+    if (buf.length < 2 + ulen + 1 + plen) return;
+
+    const username = buf.subarray(2, 2 + ulen).toString("utf8");
+    const password = buf.subarray(3 + ulen, 3 + ulen + plen).toString("utf8");
+
+    if (!verifyProxyAuth(username, password, entry.username!, entry.password ?? "")) {
+      logger.warn(`[socks5] auth failed for conn=${connectionId}`);
+      socket.write(Buffer.from([0x01, 0x01]));
       socket.end();
       entry.connections.delete(connectionId);
       return;
     }
 
-    socket.write(Buffer.from([0x05, 0x00]));
+    socket.write(Buffer.from([0x01, 0x00]));
     socket.data.phase = "request";
-    socket.data.buffer = buf.subarray(2 + nmethods);
+    socket.data.buffer = buf.subarray(3 + ulen + plen);
 
     if (socket.data.buffer.length > 0) {
       handleSocksData(socket, Buffer.alloc(0), entry);

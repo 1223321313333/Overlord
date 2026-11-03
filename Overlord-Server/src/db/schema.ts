@@ -597,3 +597,12 @@ db.run(
   `CREATE INDEX IF NOT EXISTS idx_shared_files_uploaded_by ON shared_files(uploaded_by);`,
 );
 
+db.run(`
+  CREATE TABLE IF NOT EXISTS socks5_proxies (
+    port INTEGER PRIMARY KEY,
+    client_id TEXT NOT NULL,
+    username TEXT,
+    password TEXT,
+    created_at INTEGER NOT NULL
+  );
+`);

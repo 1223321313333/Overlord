@@ -1938,6 +1938,13 @@ var (
 	nativeTextureHEVCMu       sync.Mutex
 	nativeTextureHEVCEnc      *nativeD3D11TextureH264Encoder
 	nativeTextureHEVCForceIDR atomic.Bool
+
+	hevcD3D11Backend    h264D3D11TextureBackend
+	hevcD3D11BackendName string
+	// probe vars — set once and never reset; hevcD3D11BackendName may be cleared by resetNativeHEVCD3D11TextureEncoder
+	hevcD3D11ProbeOnce  sync.Once
+	hevcD3D11ProbeAvail bool
+	hevcD3D11ProbeName  string
 )
 
 func nativeTextureH264State(stream string) *nativeTextureH264StreamState {
@@ -1993,23 +2000,65 @@ func encodeNativeHEVCD3D11Texture(device, texture unsafe.Pointer, inputWidth, in
 	nativeTextureHEVCMu.Lock()
 	defer nativeTextureHEVCMu.Unlock()
 
-	if nativeTextureHEVCEnc == nil || !nativeTextureHEVCEnc.Matches(device, inputWidth, inputHeight, encodeWidth, encodeHeight, fps, dxgiFormat) {
-		if nativeTextureHEVCEnc != nil {
-			nativeTextureHEVCEnc.Close()
-			nativeTextureHEVCEnc = nil
-		}
-		enc, err := newNativeD3D11TextureEncoder(device, inputWidth, inputHeight, encodeWidth, encodeHeight, fps, dxgiFormat, "hevc")
-		if err != nil {
-			return nil, err
-		}
-		nativeTextureHEVCEnc = enc
+	req := h264D3D11TextureRequest{
+		Device: device, Texture: texture,
+		InputWidth: inputWidth, InputHeight: inputHeight,
+		EncodeWidth: encodeWidth, EncodeHeight: encodeHeight,
+		FPS: fps, DXGIFormat: dxgiFormat, ForceIDR: forceIDR || nativeTextureHEVCForceIDR.Swap(false),
 	}
-	pendingIDR := nativeTextureHEVCForceIDR.Swap(false)
-	return nativeTextureHEVCEnc.EncodeTexture(texture, forceIDR || pendingIDR)
+
+	// NVENC native path
+	if nativeTextureHEVCEnc != nil && nativeTextureHEVCEnc.Matches(device, inputWidth, inputHeight, encodeWidth, encodeHeight, fps, dxgiFormat) {
+		return nativeTextureHEVCEnc.EncodeTexture(req.Texture, req.ForceIDR)
+	}
+	// AMF/QSV backend path (non-NVIDIA GPUs)
+	if hevcD3D11Backend != nil {
+		return hevcD3D11Backend.Encode(req)
+	}
+
+	// Try NVENC first
+	if nativeTextureHEVCEnc != nil {
+		nativeTextureHEVCEnc.Close()
+		nativeTextureHEVCEnc = nil
+	}
+	enc, err := newNativeD3D11TextureEncoder(device, inputWidth, inputHeight, encodeWidth, encodeHeight, fps, dxgiFormat, "hevc")
+	if err == nil {
+		nativeTextureHEVCEnc = enc
+		return nativeTextureHEVCEnc.EncodeTexture(req.Texture, req.ForceIDR)
+	}
+
+	// NVENC unavailable — try AMF HEVC
+	if amfBackend := newAMFHEVCD3D11TextureBackend(); amfBackend != nil {
+		out, err2 := amfBackend.Encode(req)
+		if err2 == nil {
+			hevcD3D11Backend = amfBackend
+			hevcD3D11BackendName = "AMD AMF"
+			return out, nil
+		}
+		amfBackend.Reset()
+	}
+
+	// Try QSV HEVC
+	if qsvBackend := newQSVHEVCD3D11TextureBackend(); qsvBackend != nil {
+		out, err3 := qsvBackend.Encode(req)
+		if err3 == nil {
+			hevcD3D11Backend = qsvBackend
+			hevcD3D11BackendName = "Intel Quick Sync (oneVPL)"
+			return out, nil
+		}
+		qsvBackend.Reset()
+	}
+
+	return nil, err
 }
 
 func requestNativeHEVCD3D11TextureKeyframe() {
 	nativeTextureHEVCForceIDR.Store(true)
+	nativeTextureHEVCMu.Lock()
+	if hevcD3D11Backend != nil {
+		hevcD3D11Backend.RequestKeyframe()
+	}
+	nativeTextureHEVCMu.Unlock()
 }
 
 func resetNativeHEVCD3D11TextureEncoder() {
@@ -2019,5 +2068,43 @@ func resetNativeHEVCD3D11TextureEncoder() {
 		nativeTextureHEVCEnc.Close()
 		nativeTextureHEVCEnc = nil
 	}
+	if hevcD3D11Backend != nil {
+		hevcD3D11Backend.Reset()
+		hevcD3D11Backend = nil
+		hevcD3D11BackendName = ""
+	}
 	nativeTextureHEVCForceIDR.Store(false)
+}
+
+func hevcD3D11TextureAvailable() bool {
+	hevcD3D11ProbeOnce.Do(func() {
+		// NVENC: probe the actual D3D11 texture HEVC pipeline (not the RGBA software path).
+		res := RunNVENCD3D11Smoke(NVENCD3D11SmokeOptions{Codec: "hevc", Frames: 3})
+		if res.OK {
+			hevcD3D11ProbeAvail = true
+			hevcD3D11ProbeName = "NVIDIA NVENC"
+			return
+		}
+		// AMF HEVC: verify AMFVideoEncoder_HEVC component is available.
+		if ok, _ := probeAMFHEVC(); ok {
+			hevcD3D11ProbeAvail = true
+			hevcD3D11ProbeName = "AMD AMF"
+			return
+		}
+		// QSV HEVC: check oneVPL + HEVC capability.
+		if ok, _ := probeQSVHEVC(); ok {
+			hevcD3D11ProbeAvail = true
+			hevcD3D11ProbeName = "Intel Quick Sync (oneVPL)"
+			return
+		}
+	})
+	return hevcD3D11ProbeAvail
+}
+
+func hevcD3D11TextureEncoderName() string {
+	hevcD3D11TextureAvailable()
+	if hevcD3D11BackendName != "" {
+		return hevcD3D11BackendName
+	}
+	return hevcD3D11ProbeName
 }

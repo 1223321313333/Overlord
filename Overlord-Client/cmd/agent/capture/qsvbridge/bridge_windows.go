@@ -25,6 +25,14 @@ func Probe() (bool, string) {
 	return true, "Intel oneVPL H.264 hardware encoder available"
 }
 
+func ProbeHEVC() (bool, string) {
+	b := make([]byte, 512)
+	if C.overlord_qsv_probe_hevc((*C.char)(unsafe.Pointer(&b[0])), C.int(len(b))) == 0 {
+		return false, message(b, "oneVPL HEVC unavailable")
+	}
+	return true, "Intel oneVPL HEVC hardware encoder available"
+}
+
 func Create(device unsafe.Pointer, inputWidth, inputHeight, encodeWidth, encodeHeight, fps int, format uint32, bitrate int) (*Encoder, error) {
 	var h C.overlord_qsv_encoder
 	b := make([]byte, 512)
@@ -32,6 +40,17 @@ func Create(device unsafe.Pointer, inputWidth, inputHeight, encodeWidth, encodeH
 		C.int(fps), C.uint32_t(format), C.int(bitrate), &h, (*C.char)(unsafe.Pointer(&b[0])), C.int(len(b)))
 	if ok == 0 || h == nil {
 		return nil, &Error{Text: message(b, "oneVPL encoder creation failed")}
+	}
+	return &Encoder{handle: h}, nil
+}
+
+func CreateHEVC(device unsafe.Pointer, inputWidth, inputHeight, encodeWidth, encodeHeight, fps int, format uint32, bitrate int) (*Encoder, error) {
+	var h C.overlord_qsv_encoder
+	b := make([]byte, 512)
+	ok := C.overlord_qsv_create_hevc(device, C.int(inputWidth), C.int(inputHeight), C.int(encodeWidth), C.int(encodeHeight),
+		C.int(fps), C.uint32_t(format), C.int(bitrate), &h, (*C.char)(unsafe.Pointer(&b[0])), C.int(len(b)))
+	if ok == 0 || h == nil {
+		return nil, &Error{Text: message(b, "oneVPL HEVC encoder creation failed")}
 	}
 	return &Encoder{handle: h}, nil
 }

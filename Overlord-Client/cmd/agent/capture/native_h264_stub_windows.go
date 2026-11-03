@@ -32,3 +32,6 @@ func encodeNativeHEVCD3D11Texture(device, texture unsafe.Pointer, inputWidth, in
 func requestNativeHEVCD3D11TextureKeyframe() {}
 
 func resetNativeHEVCD3D11TextureEncoder() {}
+
+func hevcD3D11TextureAvailable() bool    { return false }
+func hevcD3D11TextureEncoderName() string { return "" }

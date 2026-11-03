@@ -4,6 +4,8 @@ package capture
 
 import "context"
 
+func buildHEVCEncoderList() []string { return nil }
+
 func ProbeDesktopEncoderCapabilities(_ context.Context, display int) DesktopEncoderCapabilities {
 	return completeDesktopEncoderCapabilities(DesktopEncoderCapabilities{
 		Display: display,

@@ -1023,6 +1023,8 @@ export async function handleMiscRoutes(
     }
     const clientId = typeof body?.clientId === "string" ? body.clientId.trim() : "";
     const port = typeof body?.port === "number" ? Math.floor(body.port) : 0;
+    const username = typeof body?.username === "string" ? body.username : undefined;
+    const password = typeof body?.password === "string" ? body.password : undefined;
     if (!clientId) {
       return Response.json({ ok: false, message: "clientId is required" }, { status: 400 });
     }
@@ -1032,7 +1034,7 @@ export async function handleMiscRoutes(
     if (port < 1 || port > 65535) {
       return Response.json({ ok: false, message: "port must be 1-65535" }, { status: 400 });
     }
-    const result = startProxy(clientId, port);
+    const result = startProxy(clientId, port, username, password);
     logAudit({
       timestamp: Date.now(),
       username: user.username,

@@ -25,6 +25,15 @@ func Probe() (bool, string) {
 	return true, "AMF runtime available"
 }
 
+func ProbeHEVC() (bool, string) {
+	errText := make([]byte, 512)
+	ok := C.overlord_amf_probe_hevc((*C.char)(unsafe.Pointer(&errText[0])), C.int(len(errText)))
+	if ok == 0 {
+		return false, message(errText, "AMF HEVC unavailable")
+	}
+	return true, "AMD AMF HEVC available"
+}
+
 func Create(device unsafe.Pointer, inputWidth, inputHeight, encodeWidth, encodeHeight, fps int, dxgiFormat uint32, bitrate int) (*Encoder, error) {
 	var handle C.overlord_amf_encoder
 	errText := make([]byte, 512)
@@ -33,6 +42,18 @@ func Create(device unsafe.Pointer, inputWidth, inputHeight, encodeWidth, encodeH
 		(*C.char)(unsafe.Pointer(&errText[0])), C.int(len(errText)))
 	if ok == 0 || handle == nil {
 		return nil, &Error{Text: message(errText, "AMF encoder creation failed")}
+	}
+	return &Encoder{handle: handle}, nil
+}
+
+func CreateHEVC(device unsafe.Pointer, inputWidth, inputHeight, encodeWidth, encodeHeight, fps int, dxgiFormat uint32, bitrate int) (*Encoder, error) {
+	var handle C.overlord_amf_encoder
+	errText := make([]byte, 512)
+	ok := C.overlord_amf_create_hevc(device, C.int(inputWidth), C.int(inputHeight), C.int(encodeWidth), C.int(encodeHeight),
+		C.int(fps), C.uint32_t(dxgiFormat), C.int(bitrate), &handle,
+		(*C.char)(unsafe.Pointer(&errText[0])), C.int(len(errText)))
+	if ok == 0 || handle == nil {
+		return nil, &Error{Text: message(errText, "AMF HEVC encoder creation failed")}
 	}
 	return &Encoder{handle: handle}, nil
 }

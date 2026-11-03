@@ -40,8 +40,9 @@ func completeDesktopEncoderCapabilities(caps DesktopEncoderCapabilities) Desktop
 		{Codec: "raw", Encoders: []string{"Uncompressed"}, Transports: []string{"websocket"}},
 	}
 	if hevcAvailable() {
+		hevcEncoders := buildHEVCEncoderList()
 		caps.Codecs = append([]DesktopCodecCapability{{
-			Codec: "hevc", Encoders: []string{"NVIDIA NVENC"},
+			Codec: "hevc", Encoders: hevcEncoders,
 			Transports: []string{"websocket"}, Hardware: true,
 		}}, caps.Codecs...)
 	}
@@ -65,3 +66,4 @@ func appendDesktopUniqueString(values []string, value string) []string {
 	}
 	return append(values, value)
 }
+

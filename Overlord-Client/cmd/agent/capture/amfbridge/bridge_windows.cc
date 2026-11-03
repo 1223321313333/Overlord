@@ -13,6 +13,7 @@
 #include "../../../../third_party/amf/include/core/Buffer.h"
 #include "../../../../third_party/amf/include/components/VideoConverter.h"
 #include "../../../../third_party/amf/include/components/VideoEncoderVCE.h"
+#include "../../../../third_party/amf/include/components/VideoEncoderHEVC.h"
 
 namespace {
 
@@ -23,6 +24,7 @@ struct AMFEncoder {
     amf::AMFComponent* converter = nullptr;
     amf::AMFComponent* encoder = nullptr;
     std::vector<uint8_t> pending;
+    bool is_hevc = false;
 };
 
 void set_error(char* dst, int capacity, const std::string& value) {
@@ -99,6 +101,40 @@ extern "C" int overlord_amf_probe(char* error_text, int error_capacity) {
     FreeLibrary(runtime);
     if (result != AMF_OK || !factory) {
         set_error(error_text, error_capacity, amf_error("AMFInit", result));
+        return 0;
+    }
+    return 1;
+}
+
+extern "C" int overlord_amf_probe_hevc(char* error_text, int error_capacity) {
+    HMODULE runtime = load_runtime();
+    if (!runtime) {
+        set_error(error_text, error_capacity, "AMF runtime DLL is not installed");
+        return 0;
+    }
+    auto init = reinterpret_cast<AMFInit_Fn>(GetProcAddress(runtime, AMF_INIT_FUNCTION_NAME));
+    amf::AMFFactory* factory = nullptr;
+    AMF_RESULT result = init ? init(AMF_FULL_VERSION, &factory) : AMF_FAIL;
+    if (result != AMF_OK || !factory) {
+        FreeLibrary(runtime);
+        set_error(error_text, error_capacity, amf_error("AMFInit", result));
+        return 0;
+    }
+    amf::AMFContext* context = nullptr;
+    result = factory->CreateContext(&context);
+    if (result != AMF_OK || !context) {
+        FreeLibrary(runtime);
+        set_error(error_text, error_capacity, amf_error("CreateContext", result));
+        return 0;
+    }
+    amf::AMFComponent* encoder = nullptr;
+    result = factory->CreateComponent(context, AMFVideoEncoder_HEVC, &encoder);
+    if (encoder) encoder->Release();
+    context->Terminate();
+    context->Release();
+    FreeLibrary(runtime);
+    if (result != AMF_OK) {
+        set_error(error_text, error_capacity, amf_error("CreateComponent(HEVC)", result));
         return 0;
     }
     return 1;
@@ -189,9 +225,14 @@ extern "C" int overlord_amf_encode(overlord_amf_encoder opaque, void* d3d11_text
         converted_data->Release();
         if (!converted) { result = AMF_INVALID_DATA_TYPE; goto fail_converter_output; }
         if (force_idr) {
-            converted->SetProperty(AMF_VIDEO_ENCODER_FORCE_PICTURE_TYPE, static_cast<amf_int64>(AMF_VIDEO_ENCODER_PICTURE_TYPE_IDR));
-            converted->SetProperty(AMF_VIDEO_ENCODER_INSERT_SPS, true);
-            converted->SetProperty(AMF_VIDEO_ENCODER_INSERT_PPS, true);
+            if (state->is_hevc) {
+                converted->SetProperty(AMF_VIDEO_ENCODER_HEVC_FORCE_PICTURE_TYPE, static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_PICTURE_TYPE_IDR));
+                converted->SetProperty(AMF_VIDEO_ENCODER_HEVC_INSERT_HEADER, true);
+            } else {
+                converted->SetProperty(AMF_VIDEO_ENCODER_FORCE_PICTURE_TYPE, static_cast<amf_int64>(AMF_VIDEO_ENCODER_PICTURE_TYPE_IDR));
+                converted->SetProperty(AMF_VIDEO_ENCODER_INSERT_SPS, true);
+                converted->SetProperty(AMF_VIDEO_ENCODER_INSERT_PPS, true);
+            }
         }
         result = state->encoder->SubmitInput(converted);
         if (result != AMF_OK) goto fail_encoder_submit;
@@ -215,4 +256,64 @@ fail_source: set_error(error_text, error_capacity, amf_error("CreateSurfaceFromD
 
 extern "C" void overlord_amf_destroy(overlord_amf_encoder encoder) {
     destroy(static_cast<AMFEncoder*>(encoder));
+}
+
+extern "C" int overlord_amf_create_hevc(void* d3d11_device, int input_width, int input_height,
+                                          int encode_width, int encode_height, int fps,
+                                          uint32_t dxgi_format, int bitrate,
+                                          overlord_amf_encoder* output,
+                                          char* error_text, int error_capacity) {
+    if (!output || !d3d11_device) {
+        set_error(error_text, error_capacity, "invalid AMF HEVC create arguments");
+        return 0;
+    }
+    *output = nullptr;
+    auto* state = new AMFEncoder();
+    state->is_hevc = true;
+    state->runtime = load_runtime();
+    if (!state->runtime) {
+        set_error(error_text, error_capacity, "AMF runtime DLL is not installed");
+        destroy(state);
+        return 0;
+    }
+    AMF_RESULT result;
+    auto init = reinterpret_cast<AMFInit_Fn>(GetProcAddress(state->runtime, AMF_INIT_FUNCTION_NAME));
+    result = init ? init(AMF_FULL_VERSION, &state->factory) : AMF_FAIL;
+    if (result != AMF_OK || !state->factory) goto hevc_fail_init;
+    result = state->factory->CreateContext(&state->context);
+    if (result != AMF_OK || !state->context) goto hevc_fail_context;
+    result = state->context->InitDX11(d3d11_device, amf::AMF_DX11_0);
+    if (result != AMF_OK) goto hevc_fail_dx11;
+    result = state->factory->CreateComponent(state->context, AMFVideoConverter, &state->converter);
+    if (result != AMF_OK || !state->converter) goto hevc_fail_converter;
+    state->converter->SetProperty(AMF_VIDEO_CONVERTER_OUTPUT_FORMAT, static_cast<amf_int64>(amf::AMF_SURFACE_NV12));
+    state->converter->SetProperty(AMF_VIDEO_CONVERTER_MEMORY_TYPE, static_cast<amf_int64>(amf::AMF_MEMORY_DX11));
+    state->converter->SetProperty(AMF_VIDEO_CONVERTER_OUTPUT_SIZE, AMFConstructSize(encode_width, encode_height));
+    {
+        const amf::AMF_SURFACE_FORMAT input_format = dxgi_format == 28 ? amf::AMF_SURFACE_RGBA : amf::AMF_SURFACE_BGRA;
+        result = state->converter->Init(input_format, input_width, input_height);
+    }
+    if (result != AMF_OK) goto hevc_fail_converter_init;
+    result = state->factory->CreateComponent(state->context, AMFVideoEncoder_HEVC, &state->encoder);
+    if (result != AMF_OK || !state->encoder) goto hevc_fail_encoder;
+    state->encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_USAGE, static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_USAGE_ULTRA_LOW_LATENCY));
+    state->encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_PROFILE, static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_PROFILE_MAIN));
+    state->encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_FRAMESIZE, AMFConstructSize(encode_width, encode_height));
+    state->encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_FRAMERATE, AMFConstructRate(fps, 1));
+    state->encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_TARGET_BITRATE, static_cast<amf_int64>(bitrate));
+    state->encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_LOWLATENCY_MODE, true);
+    state->encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_HEADER_INSERTION_MODE,
+        static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_HEADER_INSERTION_MODE_GOP_ALIGNED));
+    result = state->encoder->Init(amf::AMF_SURFACE_NV12, encode_width, encode_height);
+    if (result != AMF_OK) goto hevc_fail_encoder_init;
+    *output = state;
+    return 1;
+
+hevc_fail_encoder_init: set_error(error_text, error_capacity, amf_error("HEVC encoder Init", result)); destroy(state); return 0;
+hevc_fail_encoder: set_error(error_text, error_capacity, amf_error("CreateComponent HEVC encoder", result)); destroy(state); return 0;
+hevc_fail_converter_init: set_error(error_text, error_capacity, amf_error("HEVC video converter Init", result)); destroy(state); return 0;
+hevc_fail_converter: set_error(error_text, error_capacity, amf_error("CreateComponent HEVC converter", result)); destroy(state); return 0;
+hevc_fail_dx11: set_error(error_text, error_capacity, amf_error("HEVC InitDX11", result)); destroy(state); return 0;
+hevc_fail_context: set_error(error_text, error_capacity, amf_error("HEVC CreateContext", result)); destroy(state); return 0;
+hevc_fail_init: set_error(error_text, error_capacity, amf_error("HEVC AMFInit", result)); destroy(state); return 0;
 }

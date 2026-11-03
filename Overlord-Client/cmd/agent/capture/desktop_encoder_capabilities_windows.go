@@ -321,3 +321,22 @@ func appendUniqueString(values []string, value string) []string {
 }
 
 func even(value int) int { return value - value%2 }
+
+func buildHEVCEncoderList() []string {
+	var encoders []string
+	enc, err := newNativeHEVCEncoder("probe", 1280, 720, 30)
+	if err == nil {
+		enc.Close()
+		encoders = append(encoders, "NVIDIA NVENC")
+	}
+	if ok, _ := probeAMFHEVC(); ok {
+		encoders = append(encoders, "AMD AMF")
+	}
+	if ok, _ := probeQSVHEVC(); ok {
+		encoders = append(encoders, "Intel Quick Sync (oneVPL)")
+	}
+	if len(encoders) == 0 {
+		encoders = []string{"NVIDIA NVENC"}
+	}
+	return encoders
+}

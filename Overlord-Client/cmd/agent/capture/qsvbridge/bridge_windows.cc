@@ -195,6 +195,22 @@ extern "C" int overlord_qsv_probe(char* error_text, int error_capacity) {
     destroy(s); return ok ? 1 : 0;
 }
 
+extern "C" int overlord_qsv_probe_hevc(char* error_text, int error_capacity) {
+    auto* s = new QSVEncoder(); std::string error;
+    bool ok = s->api.open(error);
+    if (ok) {
+        s->loader = s->api.Load();
+        ok = s->loader != nullptr;
+        if (ok) ok = config_u32(s, "mfxImplDescription.Impl", MFX_IMPL_TYPE_HARDWARE, error) &&
+                     config_u32(s, "mfxImplDescription.VendorID", 0x8086, error) &&
+                     config_u32(s, "mfxImplDescription.mfxEncoderDescription.encoder.CodecID", MFX_CODEC_HEVC, error) &&
+                     config_u32(s, "mfxImplDescription.AccelerationMode", MFX_ACCEL_MODE_VIA_D3D11, error);
+        if (ok) { mfxSession sess = nullptr; ok = s->api.CreateSession(s->loader, 0, &sess) == MFX_ERR_NONE; if (sess) s->api.Close(sess); }
+    }
+    if (!ok) set_error(error_text, error_capacity, error);
+    destroy(s); return ok ? 1 : 0;
+}
+
 extern "C" int overlord_qsv_create(void* device, int input_width, int input_height,
     int width, int height, int fps, uint32_t, int bitrate, overlord_qsv_encoder* output,
     char* error_text, int error_capacity) {
@@ -265,3 +281,46 @@ fail: set_error(error_text, error_capacity, error); return 0;
 }
 
 extern "C" void overlord_qsv_destroy(overlord_qsv_encoder encoder) { destroy(static_cast<QSVEncoder*>(encoder)); }
+
+extern "C" int overlord_qsv_create_hevc(void* device, int input_width, int input_height,
+    int width, int height, int fps, uint32_t, int bitrate, overlord_qsv_encoder* output,
+    char* error_text, int error_capacity) {
+    if (!device || !output || input_width <= 0 || input_height <= 0 || width <= 0 || height <= 0 || fps <= 0) {
+        set_error(error_text, error_capacity, "invalid oneVPL HEVC create arguments"); return 0;
+    }
+    *output = nullptr; auto* s = new QSVEncoder(); std::string error;
+    s->device = static_cast<ID3D11Device*>(device); s->device->AddRef(); s->device->GetImmediateContext(&s->context);
+    s->inputWidth = input_width; s->inputHeight = input_height; s->width = width; s->height = height;
+    if (!s->context) { error = "ID3D11Device::GetImmediateContext returned null"; goto hevc_fail; }
+    if (!validate_intel_device(s, error) || !protect_device_context(s, error) || !s->api.open(error)) goto hevc_fail;
+    s->loader = s->api.Load();
+    if (!s->loader) { error = "MFXLoad found no oneVPL dispatcher"; goto hevc_fail; }
+    if (!config_u32(s, "mfxImplDescription.Impl", MFX_IMPL_TYPE_HARDWARE, error) ||
+        !config_u32(s, "mfxImplDescription.VendorID", 0x8086, error) ||
+        !config_u32(s, "mfxImplDescription.mfxEncoderDescription.encoder.CodecID", MFX_CODEC_HEVC, error) ||
+        !config_u32(s, "mfxImplDescription.AccelerationMode", MFX_ACCEL_MODE_VIA_D3D11, error) ||
+        !config_u32(s, "mfxImplDescription.ApiVersion.Version", (2u << 16) | 10u, error)) goto hevc_fail;
+    {
+        mfxStatus sts = s->api.CreateSession(s->loader, 0, &s->session);
+        if (sts != MFX_ERR_NONE || !s->session) { error = status_error("MFXCreateSession (Intel D3D11 HEVC)", sts); goto hevc_fail; }
+        sts = s->api.SetHandle(s->session, MFX_HANDLE_D3D11_DEVICE, device);
+        if (sts != MFX_ERR_NONE) { error = status_error("MFXVideoCORE_SetHandle HEVC", sts); goto hevc_fail; }
+        if (!init_video_processor(s, error)) goto hevc_fail;
+        mfxVideoParam p = {}; p.IOPattern = MFX_IOPATTERN_IN_VIDEO_MEMORY; p.AsyncDepth = 1;
+        p.mfx.CodecId = MFX_CODEC_HEVC; p.mfx.CodecProfile = MFX_PROFILE_HEVC_MAIN;
+        p.mfx.TargetUsage = MFX_TARGETUSAGE_BEST_SPEED; p.mfx.RateControlMethod = MFX_RATECONTROL_VBR;
+        p.mfx.TargetKbps = static_cast<mfxU16>(std::max(1, bitrate / 1000)); p.mfx.GopRefDist = 1;
+        p.mfx.GopPicSize = static_cast<mfxU16>(std::max(fps * 2, 1)); p.mfx.IdrInterval = 0;
+        p.mfx.FrameInfo.FourCC = MFX_FOURCC_NV12; p.mfx.FrameInfo.ChromaFormat = MFX_CHROMAFORMAT_YUV420;
+        p.mfx.FrameInfo.Width = static_cast<mfxU16>((width + 15) & ~15); p.mfx.FrameInfo.Height = static_cast<mfxU16>((height + 15) & ~15);
+        p.mfx.FrameInfo.CropW = static_cast<mfxU16>(width); p.mfx.FrameInfo.CropH = static_cast<mfxU16>(height);
+        p.mfx.FrameInfo.FrameRateExtN = fps; p.mfx.FrameInfo.FrameRateExtD = 1; p.mfx.FrameInfo.PicStruct = MFX_PICSTRUCT_PROGRESSIVE;
+        sts = s->api.EncodeInit(s->session, &p);
+        if (sts < MFX_ERR_NONE) { error = status_error("MFXVideoENCODE_Init HEVC", sts); goto hevc_fail; }
+        sts = s->api.GetHandle(s->session, MFX_HANDLE_MEMORY_INTERFACE, reinterpret_cast<mfxHDL*>(&s->memory));
+        if (sts != MFX_ERR_NONE || !s->memory) { error = status_error("MFXGetMemoryInterface HEVC", sts); goto hevc_fail; }
+    }
+    s->bitstream.resize(std::max<size_t>(1024 * 1024, static_cast<size_t>(bitrate) / 2));
+    *output = s; return 1;
+hevc_fail: set_error(error_text, error_capacity, error); destroy(s); return 0;
+}

@@ -110,6 +110,28 @@
               The SOCKS5 proxy will listen on 0.0.0.0:&lt;port&gt; on this server.
             </p>
           </div>
+          <div>
+            <label class="block text-sm font-medium text-slate-300 mb-2">
+              Authentication <span class="text-slate-500 font-normal">(optional)</span>
+            </label>
+            <div class="flex gap-2">
+              <input
+                id="modalUsernameInput"
+                type="text"
+                placeholder="Username"
+                autocomplete="off"
+                class="w-1/2 px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+              <input
+                id="modalPasswordInput"
+                type="password"
+                placeholder="Password"
+                autocomplete="new-password"
+                class="w-1/2 px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+            </div>
+            <p class="text-xs text-slate-400 mt-1">Leave empty to allow unauthenticated connections.</p>
+          </div>
           <div class="flex gap-2 justify-end pt-2">
             <button id="modalCancelBtn" class="button">Cancel</button>
             <button id="modalAddBtn" class="button primary">
