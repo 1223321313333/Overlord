@@ -21,16 +21,19 @@ require (
 	github.com/pion/rtcp v1.2.15
 	github.com/pion/rtp v1.8.10
 	github.com/pion/webrtc/v4 v4.0.7
+	github.com/refraction-networking/utls v1.8.2
 	github.com/thesyncim/gopus v0.1.1
 	golang.org/x/crypto v0.49.0
 	golang.org/x/sys v0.44.0
 )
 
 require (
+	github.com/andybalholm/brotli v1.0.6 // indirect
 	github.com/gen2brain/x264-go/x264c v0.0.0-20241022182000-732e1bdb7da2 // indirect
 	github.com/gen2brain/x264-go/yuv v0.0.0-20221204084822-82ee2951dea2 // indirect
 	github.com/godbus/dbus/v5 v5.1.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
+	github.com/klauspost/compress v1.17.4 // indirect
 	github.com/lxn/win v0.0.0-20210218163916-a377121e959e // indirect
 	github.com/pion/datachannel v1.5.10 // indirect
 	github.com/pion/dtls/v3 v3.0.4 // indirect

