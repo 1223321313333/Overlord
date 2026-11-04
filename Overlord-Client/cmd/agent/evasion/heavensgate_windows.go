@@ -66,7 +66,7 @@ func buildHGateStub(ssn uint16) *HGateProc {
 	}
 	// All absolute addresses embedded in the 32-bit stub must fit in 32 bits.
 	if base+0x200 > 0xFFFFFFFF {
-		windows.VirtualFree(windows.Handle(base), 0, windows.MEM_RELEASE)
+		modKernel32.NewProc("VirtualFree").Call(base, 0, uintptr(windows.MEM_RELEASE))
 		return nil
 	}
 
