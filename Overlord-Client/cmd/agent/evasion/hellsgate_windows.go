@@ -186,10 +186,15 @@ func hgFindSSN(funcName string) (uint16, bool) {
 	return 0, false
 }
 
-// hgAlloc allocates a private RWX page for a stub.
+// hgAlloc returns executable memory for a stub.
+// Tries module stomping first (MEM_IMAGE, no private RWX) and falls back to
+// a private VirtualAlloc (MEM_PRIVATE RWX) if stomping is unavailable.
 func hgAlloc(size uint32) uintptr {
+	if addr := stompAlloc(size); addr != 0 {
+		return addr
+	}
 	addr, _, _ := modKernel32.NewProc("VirtualAlloc").Call(
-		0, uintptr(size), 0x3000 /*MEM_COMMIT|RESERVE*/, 0x40, /*PAGE_EXECUTE_READWRITE*/
+		0, uintptr(size), 0x3000, 0x40,
 	)
 	return addr
 }
@@ -251,6 +256,10 @@ func NewHGProc(name string) *HGProc {
 		s[10] = 0xC3                // ret
 		// bytes 11-19 are zero (nop-equivalent after ret)
 	}
+
+	// Flip from RWX to RX — stomped pages (MEM_IMAGE) no longer appear as
+	// private RWX; private-fallback pages remain RWX (unavoidable).
+	stompFinalize(addr, hgStubSize)
 
 	return &HGProc{stub: addr}
 }

