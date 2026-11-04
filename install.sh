@@ -1,124 +1,220 @@
 #!/usr/bin/env bash
-# Overlord — Linux native installer
-# Usage:
-#   curl -fsSL https://raw.githubusercontent.com/doesntbreaktos/Overlord/main/install.sh | bash
-# or, if you already have the repo:
-#   bash install.sh
+# Overlord installer — Linux
 #
-# What it does:
-#   1. Installs Bun (if missing)
-#   2. Installs Go 1.22+ (if missing)
-#   3. Clones the repo (if not already in it)
-#   4. Installs server dependencies
-#   5. Builds server + Go agent
-#   6. Prints first-run instructions
+# One-liner (Docker, recommended):
+#   curl -fsSL https://raw.githubusercontent.com/doesntbreaktos/Overlord/main/install.sh | bash
+#
+# One-liner (native, no Docker):
+#   curl -fsSL https://raw.githubusercontent.com/doesntbreaktos/Overlord/main/install.sh | MODE=native bash
+#
+# Flags when running directly:
+#   bash install.sh docker    — Docker mode
+#   bash install.sh native    — native (Bun + Go, build from source)
+#   bash install.sh           — interactive menu
 
 set -euo pipefail
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
-info()    { echo -e "${CYAN}[overlord]${NC} $*"; }
-ok()      { echo -e "${GREEN}[ok]${NC} $*"; }
-warn()    { echo -e "${YELLOW}[warn]${NC} $*"; }
-die()     { echo -e "${RED}[error]${NC} $*" >&2; exit 1; }
+# ── colours ───────────────────────────────────────────────────────────────────
+if [ -t 1 ]; then
+  R='\033[0;31m' G='\033[0;32m' Y='\033[1;33m' C='\033[0;36m' B='\033[1m' N='\033[0m'
+else
+  R='' G='' Y='' C='' B='' N=''
+fi
+info() { echo -e "${C}[overlord]${N} $*"; }
+ok()   { echo -e "${G}[ok]${N} $*"; }
+warn() { echo -e "${Y}[warn]${N} $*"; }
+die()  { echo -e "${R}[error]${N} $*" >&2; exit 1; }
 
 REPO_URL="https://github.com/doesntbreaktos/Overlord.git"
-GO_MIN_MAJOR=1; GO_MIN_MINOR=21
-BUN_MIN="1.0.0"
+COMPOSE_URL="https://raw.githubusercontent.com/doesntbreaktos/Overlord/main/docker-compose.yml"
 INSTALL_DIR="${OVERLORD_DIR:-$HOME/overlord}"
+GO_MIN_MINOR=21
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+have() { command -v "$1" &>/dev/null; }
+need() { have "$1" || die "Required tool not found: $1 — install it and retry."; }
 
-need_cmd() { command -v "$1" &>/dev/null || die "Required command not found: $1 — install it and retry."; }
-have_cmd() { command -v "$1" &>/dev/null; }
+# ── mode selection ────────────────────────────────────────────────────────────
 
-version_ge() {
-    # returns 0 if $1 >= $2 (both "1.21.4" style)
-    printf '%s\n%s\n' "$2" "$1" | sort -V -C
+MODE="${MODE:-${1:-}}"
+
+pick_mode() {
+    echo ""
+    echo -e "${B}How do you want to install Overlord?${N}"
+    echo ""
+    echo "  1) Docker  — pull the pre-built image, zero build time (recommended on Linux)"
+    echo "  2) Native  — build from source with Bun + Go (recommended on Windows servers,"
+    echo "               or when you want to modify the source)"
+    echo ""
+    printf "Enter 1 or 2: "
+    local choice
+    read -r choice
+    case "$choice" in
+        1) MODE=docker ;;
+        2) MODE=native ;;
+        *) die "Invalid choice: $choice" ;;
+    esac
 }
 
-# ── Bun ───────────────────────────────────────────────────────────────────────
+case "${MODE:-}" in
+    docker|1) MODE=docker ;;
+    native|2) MODE=native ;;
+    "")
+        # Non-interactive (piped): default to Docker
+        if [ ! -t 0 ] && [ ! -t 1 ]; then
+            MODE=docker
+        else
+            pick_mode
+        fi
+        ;;
+    *) die "Unknown mode: $MODE  (use 'docker' or 'native')" ;;
+esac
+
+echo ""
+echo -e "${C}╔══════════════════════════════════════╗${N}"
+echo -e "${C}║   Overlord Installer — Linux         ║${N}"
+echo -e "${C}║   Mode: ${B}${MODE}${N}${C}$(printf '%*s' $((26 - ${#MODE})) '')║${N}"
+echo -e "${C}╚══════════════════════════════════════╝${N}"
+echo ""
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DOCKER MODE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+docker_mode() {
+    # ── install Docker if missing ──────────────────────────────────────────────
+    if ! have docker; then
+        info "Docker not found — installing via convenience script..."
+        need curl
+        curl -fsSL https://get.docker.com | sh
+        # Add current user to docker group so we don't need sudo for every command
+        if getent group docker &>/dev/null; then
+            sudo usermod -aG docker "$(whoami)" 2>/dev/null || true
+            warn "Added $(whoami) to the docker group."
+            warn "You may need to log out and back in for group changes to take effect."
+            warn "For now, using sudo for docker commands."
+            DOCKER_CMD="sudo docker"
+        fi
+    fi
+    DOCKER_CMD="${DOCKER_CMD:-docker}"
+
+    if ! $DOCKER_CMD compose version &>/dev/null 2>&1; then
+        die "docker compose plugin not found. Install Docker Engine with the compose plugin: https://docs.docker.com/engine/install/"
+    fi
+    ok "Docker $($DOCKER_CMD --version | grep -oP '[0-9]+\.[0-9]+\.[0-9]+'  | head -1) with Compose ready"
+
+    # ── get the compose file ───────────────────────────────────────────────────
+    if [ -f "docker-compose.yml" ] && [ -f "Overlord-Server/package.json" ]; then
+        ok "Already inside the Overlord repository — using local docker-compose.yml"
+        COMPOSE_FILE="docker-compose.yml"
+    else
+        COMPOSE_DIR="$INSTALL_DIR-docker"
+        mkdir -p "$COMPOSE_DIR"
+        COMPOSE_FILE="$COMPOSE_DIR/docker-compose.yml"
+        if [ -f "$COMPOSE_FILE" ]; then
+            info "Updating existing compose file at $COMPOSE_DIR ..."
+        else
+            info "Downloading docker-compose.yml → $COMPOSE_FILE ..."
+        fi
+        if have curl; then
+            curl -fsSL "$COMPOSE_URL" -o "$COMPOSE_FILE"
+        else
+            need wget
+            wget -q "$COMPOSE_URL" -O "$COMPOSE_FILE"
+        fi
+        cd "$COMPOSE_DIR"
+        ok "Compose file ready at $(pwd)/docker-compose.yml"
+    fi
+
+    # ── pull and start ─────────────────────────────────────────────────────────
+    info "Pulling latest image..."
+    $DOCKER_CMD compose pull
+
+    info "Starting Overlord..."
+    $DOCKER_CMD compose up -d
+
+    echo ""
+    ok "Overlord is running."
+    echo ""
+    echo -e "${C}Get the initial admin password:${N}"
+    echo "  $DOCKER_CMD compose exec overlord-server grep bootstrapPassword /app/data/save.json"
+    echo ""
+    echo -e "${C}Open the panel:${N}  https://localhost:5173"
+    echo ""
+    echo -e "${C}Update later:${N}"
+    echo "  $DOCKER_CMD compose pull && $DOCKER_CMD compose up -d"
+    echo ""
+    echo -e "${C}Stop:${N}  $DOCKER_CMD compose down"
+    echo ""
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  NATIVE MODE
+# ═══════════════════════════════════════════════════════════════════════════════
 
 install_bun() {
     info "Installing Bun..."
-    if have_cmd curl; then
+    if have curl; then
         curl -fsSL https://bun.sh/install | bash
-    elif have_cmd wget; then
-        wget -qO- https://bun.sh/install | bash
     else
-        die "Neither curl nor wget found. Install one and retry."
+        need wget
+        wget -qO- https://bun.sh/install | bash
     fi
-    # The installer puts bun in $HOME/.bun/bin — add to PATH for this session
     export PATH="$HOME/.bun/bin:$PATH"
-    ok "Bun installed: $(bun --version)"
+    have bun || die "Bun installed but not found in PATH — open a new shell and retry."
+    ok "Bun $(bun --version) installed"
+}
+
+install_go() {
+    local arch
+    case "$(uname -m)" in
+        x86_64)  arch=amd64 ;;
+        aarch64) arch=arm64 ;;
+        armv7*)  arch=armv6l ;;
+        *)       die "Unsupported arch for automatic Go install: $(uname -m)" ;;
+    esac
+    info "Fetching latest Go release (linux/$arch)..."
+    local ver
+    if have curl; then
+        ver=$(curl -fsSL "https://go.dev/VERSION?m=text" | head -1)
+    else
+        ver=$(wget -qO- "https://go.dev/VERSION?m=text" | head -1)
+    fi
+    ver="${ver:-go1.22.5}"
+    local tarball="${ver}.linux-${arch}.tar.gz"
+    info "Downloading https://go.dev/dl/$tarball ..."
+    if have curl; then
+        curl -fsSL "https://go.dev/dl/$tarball" -o "/tmp/$tarball"
+    else
+        wget -q "https://go.dev/dl/$tarball" -O "/tmp/$tarball"
+    fi
+    sudo rm -rf /usr/local/go
+    sudo tar -C /usr/local -xzf "/tmp/$tarball"
+    rm -f "/tmp/$tarball"
+    export PATH="/usr/local/go/bin:$PATH"
+    ok "Go $(go version) installed"
 }
 
 check_bun() {
-    if have_cmd bun; then
+    if have bun; then
         ok "Bun $(bun --version) found"
     else
         install_bun
     fi
 }
 
-# ── Go ────────────────────────────────────────────────────────────────────────
-
-install_go() {
-    local arch
-    arch=$(uname -m)
-    case "$arch" in
-        x86_64)   arch="amd64" ;;
-        aarch64)  arch="arm64" ;;
-        armv7*)   arch="armv6l" ;;
-        *)        die "Unsupported architecture for automatic Go install: $arch" ;;
-    esac
-
-    info "Fetching latest Go release for linux/$arch..."
-    local ver
-    if have_cmd curl; then
-        ver=$(curl -fsSL "https://go.dev/VERSION?m=text" | head -1)
-    elif have_cmd wget; then
-        ver=$(wget -qO- "https://go.dev/VERSION?m=text" | head -1)
-    fi
-    ver="${ver:-go1.22.5}"
-    local tarball="${ver}.linux-${arch}.tar.gz"
-    local url="https://go.dev/dl/${tarball}"
-
-    info "Downloading $url ..."
-    if have_cmd curl; then
-        curl -fsSL "$url" -o "/tmp/$tarball"
-    else
-        wget -q "$url" -O "/tmp/$tarball"
-    fi
-
-    info "Installing Go to /usr/local/go (needs sudo)..."
-    sudo rm -rf /usr/local/go
-    sudo tar -C /usr/local -xzf "/tmp/$tarball"
-    rm -f "/tmp/$tarball"
-
-    export PATH="/usr/local/go/bin:$PATH"
-    ok "Go $(go version) installed"
-}
-
 check_go() {
-    if have_cmd go; then
-        local ver
-        ver=$(go version | grep -oP 'go\K[0-9]+\.[0-9]+')
-        local major minor
-        major=$(echo "$ver" | cut -d. -f1)
-        minor=$(echo "$ver" | cut -d. -f2)
-        if [ "$major" -gt "$GO_MIN_MAJOR" ] || \
-           ( [ "$major" -eq "$GO_MIN_MAJOR" ] && [ "$minor" -ge "$GO_MIN_MINOR" ] ); then
+    if have go; then
+        local ver major minor
+        ver=$(go version | grep -oP '[0-9]+\.[0-9]+' | head -1)
+        major=${ver%%.*}; minor=${ver##*.}
+        if [ "$major" -gt 1 ] || [ "$minor" -ge "$GO_MIN_MINOR" ]; then
             ok "Go $ver found"
-        else
-            warn "Go $ver is older than required $GO_MIN_MAJOR.$GO_MIN_MINOR — reinstalling"
-            install_go
+            return
         fi
-    else
-        install_go
+        warn "Go $ver < 1.$GO_MIN_MINOR — reinstalling"
     fi
+    install_go
 }
-
-# ── Repo ──────────────────────────────────────────────────────────────────────
 
 ensure_repo() {
     if [ -f "Overlord-Server/package.json" ]; then
@@ -126,62 +222,52 @@ ensure_repo() {
         return
     fi
     if [ -d "$INSTALL_DIR/.git" ]; then
-        info "Found existing clone at $INSTALL_DIR, pulling latest..."
+        info "Pulling latest at $INSTALL_DIR ..."
         git -C "$INSTALL_DIR" pull --ff-only
     else
+        need git
         info "Cloning $REPO_URL → $INSTALL_DIR ..."
-        need_cmd git
         git clone --depth=1 "$REPO_URL" "$INSTALL_DIR"
     fi
     cd "$INSTALL_DIR"
     ok "Repository ready at $(pwd)"
 }
 
-# ── Build ─────────────────────────────────────────────────────────────────────
+native_mode() {
+    check_bun
+    check_go
+    ensure_repo
 
-build_server() {
     info "Installing server dependencies..."
     cd Overlord-Server
     bun install --frozen-lockfile
+
     info "Building server (production)..."
     bun run build
+    bun run build:prod:linux
     cd ..
-    ok "Server built → Overlord-Server/dist/"
+
+    info "Copying client source for runtime agent builds..."
+    mkdir -p Overlord-Server/dist/Overlord-Client
+    rsync -a --exclude=build --exclude=.git "$PWD/Overlord-Client/" "$PWD/Overlord-Server/dist/Overlord-Client/" 2>/dev/null \
+        || cp -a "$PWD/Overlord-Client/." "$PWD/Overlord-Server/dist/Overlord-Client/"
+    ok "Build complete"
+
+    echo ""
+    ok "Installation complete."
+    echo ""
+    echo -e "${C}Start the server:${N}"
+    echo "  bash scripts/start-prod.sh"
+    echo ""
+    echo -e "${C}Get the initial admin password (first run only):${N}"
+    echo "  grep bootstrapPassword Overlord-Server/data/save.json"
+    echo ""
+    echo -e "${C}Open the panel:${N}  https://localhost:5173"
+    echo ""
 }
 
-build_agent() {
-    info "Building Go agent (windows/amd64)..."
-    cd Overlord-Client
-    GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o ../Overlord-Server/data/builds/agent.exe ./cmd/agent/
-    cd ..
-    ok "Agent built → Overlord-Server/data/builds/agent.exe"
-}
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-
-echo ""
-echo -e "${CYAN}╔══════════════════════════════════╗${NC}"
-echo -e "${CYAN}║      Overlord Installer          ║${NC}"
-echo -e "${CYAN}╚══════════════════════════════════╝${NC}"
-echo ""
-
-check_bun
-check_go
-ensure_repo
-build_server
-mkdir -p Overlord-Server/data/builds
-build_agent
-
-echo ""
-ok "Installation complete."
-echo ""
-echo -e "${CYAN}Next steps:${NC}"
-echo "  1. Start the server:"
-echo "     bash scripts/start-prod.sh"
-echo ""
-echo "  2. Get the initial admin password (first run only):"
-echo "     grep bootstrapPassword Overlord-Server/data/save.json"
-echo ""
-echo "  3. Open the panel:"
-echo "     https://localhost:5173"
-echo ""
+# ── dispatch ──────────────────────────────────────────────────────────────────
+case "$MODE" in
+    docker) docker_mode ;;
+    native) native_mode ;;
+esac
