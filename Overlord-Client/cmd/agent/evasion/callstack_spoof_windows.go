@@ -335,14 +335,13 @@ func allocSpoofTrampoline() uintptr {
 func SpoofedSyscall(stub uintptr, args ...uintptr) (r1, r2 uintptr, err syscall.Errno) {
 	initSpoofing()
 
-	var a [5]uintptr
-	copy(a[:], args)
-
 	if hgGadget == 0 || hgTrampoline == 0 || len(args) > 5 {
-		// Fallback: direct call (no spoofing for >5-arg calls).
-		return syscall.SyscallN(stub, a[0], a[1], a[2], a[3], a[4])
+		// Fallback: direct stub, all args preserved, no call-stack spoofing.
+		return syscall.SyscallN(stub, args...)
 	}
 
+	var a [5]uintptr
+	copy(a[:], args)
 	r1, r2, err = syscall.SyscallN(hgTrampoline, hgGadget, stub, a[0], a[1], a[2], a[3], a[4])
 	return
 }

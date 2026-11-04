@@ -37,3 +37,21 @@ func sNtWriteVirtualMemory() string {
 func sNtFlushInstructionCache() string {
 	return stackStr('N', 't', 'F', 'l', 'u', 's', 'h', 'I', 'n', 's', 't', 'r', 'u', 'c', 't', 'i', 'o', 'n', 'C', 'a', 'c', 'h', 'e')
 }
+func sKernelBase() string {
+	return stackStr('K', 'e', 'r', 'n', 'e', 'l', 'B', 'a', 's', 'e', '.', 'd', 'l', 'l')
+}
+func sNtCreateSection() string {
+	return stackStr('N', 't', 'C', 'r', 'e', 'a', 't', 'e', 'S', 'e', 'c', 't', 'i', 'o', 'n')
+}
+func sNtMapViewOfSection() string {
+	return stackStr('N', 't', 'M', 'a', 'p', 'V', 'i', 'e', 'w', 'O', 'f', 'S', 'e', 'c', 't', 'i', 'o', 'n')
+}
+func sNtUnmapViewOfSection() string {
+	return stackStr('N', 't', 'U', 'n', 'm', 'a', 'p', 'V', 'i', 'e', 'w', 'O', 'f', 'S', 'e', 'c', 't', 'i', 'o', 'n')
+}
+func sNtQueueApcThread() string {
+	return stackStr('N', 't', 'Q', 'u', 'e', 'u', 'e', 'A', 'p', 'c', 'T', 'h', 'r', 'e', 'a', 'd')
+}
+func sNtGetNextThread() string {
+	return stackStr('N', 't', 'G', 'e', 't', 'N', 'e', 'x', 't', 'T', 'h', 'r', 'e', 'a', 'd')
+}

