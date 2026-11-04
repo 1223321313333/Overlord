@@ -45,3 +45,18 @@ export function createIsolatedGoBuildEnv(
     GARBLE_CACHE: path.join(cacheRoot, "garble"),
   };
 }
+
+// Same as createIsolatedGoBuildEnv but with GOPROXY=off and GOFLAGS=-mod=readonly.
+// Use for the actual compile step after modules have already been fetched and verified.
+// This prevents any unexpected network access or go.mod mutations during the build.
+export function createLockedGoBuildEnv(
+  cacheRoot: string,
+  source: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  return {
+    ...createIsolatedGoBuildEnv(cacheRoot, source),
+    GOPROXY: "off",
+    GONOSUMDB: "",
+    GOFLAGS: "-mod=readonly",
+  };
+}

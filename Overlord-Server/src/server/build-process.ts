@@ -24,12 +24,14 @@ import { runSgn } from "./sgn-manager";
 import { patchPe } from "./pe-patcher";
 import { wrapXorStub } from "./custom-crypter";
 import { resolveContainedPath } from "./upload-security";
-import { createIsolatedGoBuildEnv } from "./build-environment";
+import { createIsolatedGoBuildEnv, createLockedGoBuildEnv } from "./build-environment";
 import { cleanupMacosSdkUpload, extractAndValidateMacosSdk } from "./macos-sdk-manager";
 import { getActiveTlsSpkiPins } from "./tls-bootstrap";
 import { installProviderArtifacts, providerStagingDirectory } from "./plugin-build-provider";
 import type { PluginBuildProviderOutput } from "./plugin-runtime/runtime";
 import { buildCDllStub } from "./c-dll-builder";
+
+const GO_WINRES_VERSION = "v0.3.3";
 
 export function createAgentTlsPinsLdflag(pins: string[]): string {
   if (pins.length === 0) return "";
@@ -986,6 +988,24 @@ export async function startBuildProcess(
     sendToStream({ type: "output", text: `Stub version: ${agentVersion}\n`, level: "info" });
     sendToStream({ type: "output", text: `Client build cache: ${cacheRoot}\n`, level: "info" });
 
+    // Prefetch all Go modules into the isolated GOMODCACHE, then verify their checksums
+    // against go.sum. The actual per-target builds then run with GOPROXY=off so no
+    // unplanned network access can occur during compilation.
+    {
+      const prefetchEnv = createIsolatedGoBuildEnv(cacheRoot);
+      sendToStream({ type: "status", text: "Prefetching Go modules..." });
+      const dlResult = await $`go mod download`.env(prefetchEnv).cwd(clientDir).nothrow().quiet();
+      if (dlResult.exitCode !== 0) {
+        throw new Error(`go mod download failed: ${dlResult.stderr.toString().trim()}`);
+      }
+      sendToStream({ type: "output", text: "Verifying module checksums against go.sum...\n", level: "info" });
+      const verifyResult = await $`go mod verify`.env(prefetchEnv).cwd(clientDir).nothrow().quiet();
+      if (verifyResult.exitCode !== 0) {
+        throw new Error(`go mod verify failed — module cache may be tampered:\n${verifyResult.stdout.toString().trim()}`);
+      }
+      sendToStream({ type: "output", text: "Module checksums OK.\n", level: "info" });
+    }
+
     if (config.macosSdkArchivePath && config.macosSdkUploadDir) {
       sendToStream({ type: "status", text: "Validating uploaded macOS SDK..." });
       macosSdkRoot = await extractAndValidateMacosSdk({
@@ -1111,8 +1131,8 @@ export async function startBuildProcess(
           hasWinres = true;
         } catch {
           try {
-            sendToStream({ type: "output", text: "Installing go-winres...\n", level: "info" });
-            await $`go install github.com/tc-hib/go-winres@latest`.env({ ...isolatedBuildEnv, GOMODCACHE: goModCacheDir }).quiet();
+            sendToStream({ type: "output", text: `Installing go-winres ${GO_WINRES_VERSION}...\n`, level: "info" });
+            await $`go install ${"github.com/tc-hib/go-winres@" + GO_WINRES_VERSION}`.env({ ...isolatedBuildEnv, GOMODCACHE: goModCacheDir }).quiet();
             if (goBinDir && fs.existsSync(path.join(goBinDir, winresExe))) {
               winresBin = path.join(goBinDir, winresExe);
               hasWinres = true;
@@ -1567,7 +1587,7 @@ func binderExec(outPath string, _ []byte) {
       }
 
       const env: NodeJS.ProcessEnv = {
-        ...createIsolatedGoBuildEnv(cacheRoot),
+        ...createLockedGoBuildEnv(cacheRoot),
         GOOS: effectiveOs,
         GOARCH: actualArch,
         CGO_ENABLED: config.disableCgo === true ? "0" : "1",
