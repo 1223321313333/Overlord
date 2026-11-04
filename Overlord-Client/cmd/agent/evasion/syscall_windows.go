@@ -24,6 +24,9 @@ var (
 
 	hgNtFlushOnce sync.Once
 	hgNtFlushProc *HGProc
+
+	hgNtSetInfoOnce sync.Once
+	hgNtSetInfoProc *HGProc
 )
 
 func getNtProtectProc() *HGProc {
@@ -45,6 +48,13 @@ func getNtFlushProc() *HGProc {
 		hgNtFlushProc = NewHGProc("NtFlushInstructionCache")
 	})
 	return hgNtFlushProc
+}
+
+func getNtSetInfoProc() *HGProc {
+	hgNtSetInfoOnce.Do(func() {
+		hgNtSetInfoProc = NewHGProc("NtSetInformationProcess")
+	})
+	return hgNtSetInfoProc
 }
 
 // ntProtect changes memory protection via a direct NtProtectVirtualMemory

