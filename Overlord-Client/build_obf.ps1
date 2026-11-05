@@ -14,6 +14,20 @@ if (-not (Get-Command garble -ErrorAction SilentlyContinue)) {
     if ($LASTEXITCODE -ne 0) { throw "garble install failed" }
 }
 
+# Install goversioninfo if not present
+if (-not (Get-Command goversioninfo -ErrorAction SilentlyContinue)) {
+    Write-Host "[*] goversioninfo not found, installing..."
+    go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo@latest
+    if ($LASTEXITCODE -ne 0) { throw "goversioninfo install failed" }
+}
+
+# Generate VERSIONINFO resource (.syso) so the binary has legit PE metadata
+Write-Host "[*] Generating VERSIONINFO resource..."
+Push-Location cmd\agent
+goversioninfo -o resource.syso versioninfo.json
+if ($LASTEXITCODE -ne 0) { throw "goversioninfo failed" }
+Pop-Location
+
 Write-Host "[*] Building obfuscated agent -> $outBinary"
 
 # -literals  encrypts all string/numeric literals at compile time

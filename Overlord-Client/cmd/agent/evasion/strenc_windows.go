@@ -55,3 +55,21 @@ func sNtQueueApcThread() string {
 func sNtGetNextThread() string {
 	return stackStr('N', 't', 'G', 'e', 't', 'N', 'e', 'x', 't', 'T', 'h', 'r', 'e', 'a', 'd')
 }
+func sNtResumeThread() string {
+	return stackStr('N', 't', 'R', 'e', 's', 'u', 'm', 'e', 'T', 'h', 'r', 'e', 'a', 'd')
+}
+func sNtWaitForSingleObject() string {
+	return stackStr('N', 't', 'W', 'a', 'i', 't', 'F', 'o', 'r', 'S', 'i', 'n', 'g', 'l', 'e', 'O', 'b', 'j', 'e', 'c', 't')
+}
+func sRtlCreateTimerQueue() string {
+	return stackStr('R', 't', 'l', 'C', 'r', 'e', 'a', 't', 'e', 'T', 'i', 'm', 'e', 'r', 'Q', 'u', 'e', 'u', 'e')
+}
+func sRtlCreateTimer() string {
+	return stackStr('R', 't', 'l', 'C', 'r', 'e', 'a', 't', 'e', 'T', 'i', 'm', 'e', 'r')
+}
+func sNtDuplicateObject() string {
+	return stackStr('N', 't', 'D', 'u', 'p', 'l', 'i', 'c', 'a', 't', 'e', 'O', 'b', 'j', 'e', 'c', 't')
+}
+func sNtGetNextProcess() string {
+	return stackStr('N', 't', 'G', 'e', 't', 'N', 'e', 'x', 't', 'P', 'r', 'o', 'c', 'e', 's', 's')
+}

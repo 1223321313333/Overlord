@@ -22,6 +22,9 @@ const (
 )
 
 var (
+	hgNtResumeThreadOnce sync.Once
+	hgNtResumeThreadProc *HGProc
+
 	hgNtProtectOnce sync.Once
 	hgNtProtectProc *HGProc
 
@@ -54,7 +57,17 @@ var (
 
 	hgNtGetNextThreadOnce sync.Once
 	hgNtGetNextThreadProc *HGProc
+
+	hgNtGetNextProcessOnce sync.Once
+	hgNtGetNextProcessProc *HGProc
 )
+
+func getNtResumeThreadProc() *HGProc {
+	hgNtResumeThreadOnce.Do(func() {
+		hgNtResumeThreadProc = NewHGProc(sNtResumeThread())
+	})
+	return hgNtResumeThreadProc
+}
 
 func getNtProtectProc() *HGProc {
 	hgNtProtectOnce.Do(func() {
@@ -131,6 +144,13 @@ func getNtGetNextThreadProc() *HGProc {
 		hgNtGetNextThreadProc = NewHGProc(sNtGetNextThread())
 	})
 	return hgNtGetNextThreadProc
+}
+
+func getNtGetNextProcessProc() *HGProc {
+	hgNtGetNextProcessOnce.Do(func() {
+		hgNtGetNextProcessProc = NewHGProc(sNtGetNextProcess())
+	})
+	return hgNtGetNextProcessProc
 }
 
 // NtAllocateVirtualMemory allocates virtual memory in a process without going
