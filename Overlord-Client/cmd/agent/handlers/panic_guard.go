@@ -14,7 +14,14 @@ import (
 const crashLogFileName = "crashlogC.log"
 
 func goSafe(label string, cancel context.CancelFunc, fn func()) {
+	select {
+	case commandSem <- struct{}{}:
+	default:
+		log.Printf("[commands] semaphore full (32), dropping %s", label)
+		return
+	}
 	go func() {
+		defer func() { <-commandSem }()
 		defer recoverAndLog(label, cancel)
 		fn()
 	}()

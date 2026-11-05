@@ -28,7 +28,7 @@ func Build(options Options) (*tls.Config, error) {
 	}
 
 	tlsConfig := &tls.Config{
-		MinVersion: tls.VersionTLS12,
+		MinVersion: tls.VersionTLS13,
 	}
 
 	if strings.TrimSpace(options.CAPath) != "" {
@@ -92,6 +92,11 @@ func verifyPinnedConnection(state tls.ConnectionState, pins [][]byte, now time.T
 	leaf := state.PeerCertificates[0]
 	if now.Before(leaf.NotBefore) || now.After(leaf.NotAfter) {
 		return fmt.Errorf("TLS peer certificate is not valid at %s", now.UTC().Format(time.RFC3339))
+	}
+	if state.ServerName != "" {
+		if err := leaf.VerifyHostname(state.ServerName); err != nil {
+			return fmt.Errorf("TLS hostname mismatch: %w", err)
+		}
 	}
 	sum := sha256.Sum256(leaf.RawSubjectPublicKeyInfo)
 	for _, pin := range pins {

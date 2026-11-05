@@ -91,8 +91,7 @@ func LoadServerURLsFromSolana(solAddress, agentToken string, rpcEndpoints []stri
 	rand.Shuffle(len(endpoints), func(i, j int) { endpoints[i], endpoints[j] = endpoints[j], endpoints[i] })
 	pacer := &rpcPacer{}
 
-	keyHash := sha256.Sum256([]byte(agentToken))
-	log.Printf("[solana] using key hash prefix: %x (token len=%d)", keyHash[:4], len(agentToken))
+	log.Printf("[solana] key verified")
 
 	var signatures []signatureInfo
 	var lastErr error

@@ -773,6 +773,8 @@ func HandleFileUploadHTTP(ctx context.Context, env *agentRuntime.Env, cmdID stri
 		InsecureSkipVerify: env.Cfg.TLSInsecureSkipVerify,
 		CAPath:             env.Cfg.TLSCAPath,
 		SPKIPins:           env.Cfg.TLSSPKIPins,
+		ClientCertPath:     env.Cfg.TLSClientCert,
+		ClientKeyPath:      env.Cfg.TLSClientKey,
 	})
 	if err != nil {
 		return wire.WriteMsg(ctx, env.Conn, wire.CommandResult{Type: "command_result", CommandID: cmdID, OK: false, Message: fmt.Sprintf("invalid TLS configuration: %v", err)})

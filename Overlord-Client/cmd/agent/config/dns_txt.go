@@ -3,6 +3,7 @@ package config
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -31,13 +32,16 @@ type dohResponse struct {
 // LoadServerURLsFromDNSTxt resolves TXT records for domain via DoH, extracts
 // WSS URLs, and verifies the HMAC-SHA256 signature using the rolling 60-second
 // window format shared with the dead-drop server endpoint.
-func LoadServerURLsFromDNSTxt(domain, agentToken string) ([]string, error) {
+// LoadServerURLsFromDNSTxt resolves TXT records for domain via DoH, extracts
+// WSS URLs, and verifies the HMAC-SHA256 signature. tlsCfg is applied to the
+// DoH HTTP client; pass nil to use the system trust store.
+func LoadServerURLsFromDNSTxt(domain, agentToken string, tlsCfg *tls.Config) ([]string, error) {
 	domain = strings.TrimSpace(domain)
 	if domain == "" {
 		return nil, fmt.Errorf("empty domain")
 	}
 
-	txts, err := queryTXTDoH(domain)
+	txts, err := queryTXTDoH(domain, tlsCfg)
 	if err != nil {
 		return nil, fmt.Errorf("DoH query failed: %w", err)
 	}
@@ -95,8 +99,12 @@ func verifyDeadDropSig(urls []string, sigB64url, agentToken string) error {
 	return fmt.Errorf("HMAC mismatch")
 }
 
-func queryTXTDoH(domain string) ([]string, error) {
-	client := &http.Client{Timeout: 8 * time.Second}
+func queryTXTDoH(domain string, tlsCfg *tls.Config) ([]string, error) {
+	var transport http.RoundTripper
+	if tlsCfg != nil {
+		transport = &http.Transport{TLSClientConfig: tlsCfg}
+	}
+	client := &http.Client{Timeout: 8 * time.Second, Transport: transport}
 	var lastErr error
 
 	for _, endpoint := range dohEndpoints {

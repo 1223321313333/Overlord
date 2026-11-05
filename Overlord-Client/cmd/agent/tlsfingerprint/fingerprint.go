@@ -38,10 +38,15 @@ func UTLSDialFunc(
 			return nil, err
 		}
 
+		nextProtos := stdCfg.NextProtos
+		if len(nextProtos) == 0 {
+			nextProtos = []string{"h2", "http/1.1"}
+		}
 		uCfg := &utls.Config{
 			ServerName:         host,
 			InsecureSkipVerify: stdCfg.InsecureSkipVerify, //nolint:gosec
 			RootCAs:            stdCfg.RootCAs,
+			NextProtos:         nextProtos,
 		}
 		for _, c := range stdCfg.Certificates {
 			uCfg.Certificates = append(uCfg.Certificates, utls.Certificate{

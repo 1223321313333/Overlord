@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -136,7 +137,7 @@ func Load() Config {
 	} else if rawServerEnabled {
 		rawServerListURL = server
 		if rawServerListURL != "" {
-			if urls, err := LoadServerURLsFromRaw(rawServerListURL); err != nil {
+			if urls, err := LoadServerURLsFromRaw(rawServerListURL, nil); err != nil {
 				log.Printf("[config] WARNING: failed to load raw server list from %q: %v", rawServerListURL, err)
 			} else {
 				serverURLs = urls
@@ -258,7 +259,7 @@ func parseSleepSeconds(s string) int {
 	return n
 }
 
-func LoadServerURLsFromRaw(rawURL string) ([]string, error) {
+func LoadServerURLsFromRaw(rawURL string, tlsCfg *tls.Config) ([]string, error) {
 	trimmed := strings.TrimSpace(rawURL)
 	if trimmed == "" {
 		return nil, fmt.Errorf("raw server list URL is empty")
@@ -277,8 +278,15 @@ func LoadServerURLsFromRaw(rawURL string) ([]string, error) {
 	if scheme != "https" && scheme != "http" {
 		return nil, fmt.Errorf("unsupported raw server list scheme: %s", parsed.Scheme)
 	}
+	if scheme == "http" {
+		log.Printf("[config] WARNING: loading server list over plain HTTP from %s — upgrade to HTTPS", parsed.Host)
+	}
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	var transport http.RoundTripper
+	if tlsCfg != nil {
+		transport = &http.Transport{TLSClientConfig: tlsCfg}
+	}
+	client := &http.Client{Timeout: 10 * time.Second, Transport: transport}
 	resp, err := client.Get(parsed.String())
 	if err != nil {
 		return nil, err
