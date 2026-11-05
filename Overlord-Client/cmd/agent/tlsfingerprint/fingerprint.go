@@ -16,14 +16,16 @@ import (
 )
 
 // UTLSDialFunc returns a DialTLSContext function that wraps a raw TCP connection
-// in a uTLS UConn configured to present a Chrome ClientHello.
+// in a uTLS UConn configured to present the ClientHello returned by pickHello.
 //
-// stdCfg is the original *tls.Config carrying pinning callbacks, root CAs,
-// client certificates, and InsecureSkipVerify — all are forwarded verbatim.
+// pickHello is called on every TLS dial so the caller can rotate fingerprints
+// (e.g. Chrome one dial, Firefox the next).  stdCfg carries pinning callbacks,
+// root CAs, client certificates, and InsecureSkipVerify — all forwarded verbatim.
 // The underlying TCP dial is provided by baseDial.
 func UTLSDialFunc(
 	baseDial func(ctx context.Context, network, addr string) (net.Conn, error),
 	stdCfg *tls.Config,
+	pickHello func() utls.ClientHelloID,
 ) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, _, err := net.SplitHostPort(addr)
@@ -73,10 +75,7 @@ func UTLSDialFunc(
 			}
 		}
 
-		// HelloChrome_Auto tracks the latest Chrome release (currently 133).
-		// Rotate to HelloFirefox_Auto on a per-session basis if fingerprint
-		// diversity is desired — both are common and trusted on corporate networks.
-		uConn := utls.UClient(rawConn, uCfg, utls.HelloChrome_Auto)
+		uConn := utls.UClient(rawConn, uCfg, pickHello())
 		if err := uConn.HandshakeContext(ctx); err != nil {
 			rawConn.Close()
 			return nil, err

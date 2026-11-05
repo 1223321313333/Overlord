@@ -59,26 +59,48 @@ func ahResolve(dllBase uintptr, wantHash uint32) uintptr {
 	return 0
 }
 
-// ahBase returns the base address of a loaded module by hash of its name.
-// Walks PEB.Ldr.InLoadOrderModuleList.
+// ahBase returns the base address of a loaded module by djb2 hash of its name.
+// Walks PEB.Ldr.InLoadOrderModuleList — no API calls, works for any loaded DLL.
+//
+// PEB layout (x64, Windows 10+):
+//
+//	PEB+0x018  Ldr              *PEB_LDR_DATA
+//	LDR+0x010  InLoadOrderModuleList  LIST_ENTRY (head)
+//
+// LDR_DATA_TABLE_ENTRY:
+//
+//	+0x000  InLoadOrderLinks.Flink   (next entry)
+//	+0x030  DllBase
+//	+0x048  BaseDllName.Length       uint16  (byte count, no null)
+//	+0x050  BaseDllName.Buffer       *uint16
 func ahBase(moduleHash uint32) uintptr {
-	// PEB at GS:[0x60] on x64; use NtCurrentPeb via undocumented field in TEB.
-	// Simpler cross-platform approach: GetModuleHandle via existing stack-string helpers.
-	// We know the module names we care about, so use a small lookup table.
-	candidates := []struct {
-		name func() string
-	}{
-		{sKernel32},
-		{sNtdll},
+	peb := getPEB()
+	if peb == 0 {
+		return 0
 	}
-	for _, c := range candidates {
-		n := c.name()
-		if djb2Str(n) == moduleHash {
-			var h windows.Handle
-			ptr, _ := windows.UTF16PtrFromString(n)
-			_ = windows.GetModuleHandleEx(0, ptr, &h)
-			return uintptr(h)
+	ldr := *(*uintptr)(unsafe.Pointer(peb + 0x18))
+	if ldr == 0 {
+		return 0
+	}
+	head := ldr + 0x10
+	flink := *(*uintptr)(unsafe.Pointer(head))
+	seen := make(map[uintptr]bool)
+	for flink != head && flink != 0 && !seen[flink] {
+		seen[flink] = true
+		nameLen := *(*uint16)(unsafe.Pointer(flink + 0x48))
+		nameBuf := *(*uintptr)(unsafe.Pointer(flink + 0x50))
+		if nameLen > 0 && nameBuf != 0 {
+			charCount := int(nameLen / 2)
+			if charCount > 260 {
+				charCount = 260
+			}
+			nameSlice := (*[260]uint16)(unsafe.Pointer(nameBuf))[:charCount:charCount]
+			name := windows.UTF16ToString(nameSlice)
+			if djb2Str(name) == moduleHash {
+				return *(*uintptr)(unsafe.Pointer(flink + 0x30))
+			}
 		}
+		flink = *(*uintptr)(unsafe.Pointer(flink))
 	}
 	return 0
 }
