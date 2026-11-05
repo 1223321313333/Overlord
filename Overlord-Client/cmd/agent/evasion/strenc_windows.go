@@ -19,6 +19,21 @@ func sAmsiScanBuffer() string {
 func sEtwEventWrite() string {
 	return stackStr('E', 't', 'w', 'E', 'v', 'e', 'n', 't', 'W', 'r', 'i', 't', 'e')
 }
+func sEtwEventWriteFull() string {
+	return stackStr('E', 't', 'w', 'E', 'v', 'e', 'n', 't', 'W', 'r', 'i', 't', 'e', 'F', 'u', 'l', 'l')
+}
+func sEtwEventWriteEx() string {
+	return stackStr('E', 't', 'w', 'E', 'v', 'e', 'n', 't', 'W', 'r', 'i', 't', 'e', 'E', 'x')
+}
+func sEtwEventWriteTransfer() string {
+	return stackStr('E', 't', 'w', 'E', 'v', 'e', 'n', 't', 'W', 'r', 'i', 't', 'e', 'T', 'r', 'a', 'n', 's', 'f', 'e', 'r')
+}
+func sEtwEventRegister() string {
+	return stackStr('E', 't', 'w', 'E', 'v', 'e', 'n', 't', 'R', 'e', 'g', 'i', 's', 't', 'e', 'r')
+}
+func sAmsiOpenSession() string {
+	return stackStr('A', 'm', 's', 'i', 'O', 'p', 'e', 'n', 'S', 'e', 's', 's', 'i', 'o', 'n')
+}
 func sNtdll() string {
 	return stackStr('n', 't', 'd', 'l', 'l', '.', 'd', 'l', 'l')
 }
