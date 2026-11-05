@@ -60,6 +60,15 @@ var (
 
 	hgNtGetNextProcessOnce sync.Once
 	hgNtGetNextProcessProc *HGProc
+
+	hgNtSuspendThreadOnce sync.Once
+	hgNtSuspendThreadProc *HGProc
+
+	hgNtGetContextThreadOnce sync.Once
+	hgNtGetContextThreadProc *HGProc
+
+	hgNtSetContextThreadOnce sync.Once
+	hgNtSetContextThreadProc *HGProc
 )
 
 func getNtResumeThreadProc() *HGProc {
@@ -151,6 +160,27 @@ func getNtGetNextProcessProc() *HGProc {
 		hgNtGetNextProcessProc = NewHGProc(sNtGetNextProcess())
 	})
 	return hgNtGetNextProcessProc
+}
+
+func getNtSuspendThreadProc() *HGProc {
+	hgNtSuspendThreadOnce.Do(func() {
+		hgNtSuspendThreadProc = NewHGProc(sNtSuspendThread())
+	})
+	return hgNtSuspendThreadProc
+}
+
+func getNtGetContextThreadProc() *HGProc {
+	hgNtGetContextThreadOnce.Do(func() {
+		hgNtGetContextThreadProc = NewHGProc(sNtGetContextThread())
+	})
+	return hgNtGetContextThreadProc
+}
+
+func getNtSetContextThreadProc() *HGProc {
+	hgNtSetContextThreadOnce.Do(func() {
+		hgNtSetContextThreadProc = NewHGProc(sNtSetContextThread())
+	})
+	return hgNtSetContextThreadProc
 }
 
 // NtAllocateVirtualMemory allocates virtual memory in a process without going

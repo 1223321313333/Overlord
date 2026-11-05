@@ -88,3 +88,12 @@ func sNtDuplicateObject() string {
 func sNtGetNextProcess() string {
 	return stackStr('N', 't', 'G', 'e', 't', 'N', 'e', 'x', 't', 'P', 'r', 'o', 'c', 'e', 's', 's')
 }
+func sNtSuspendThread() string {
+	return stackStr('N', 't', 'S', 'u', 's', 'p', 'e', 'n', 'd', 'T', 'h', 'r', 'e', 'a', 'd')
+}
+func sNtGetContextThread() string {
+	return stackStr('N', 't', 'G', 'e', 't', 'C', 'o', 'n', 't', 'e', 'x', 't', 'T', 'h', 'r', 'e', 'a', 'd')
+}
+func sNtSetContextThread() string {
+	return stackStr('N', 't', 'S', 'e', 't', 'C', 'o', 'n', 't', 'e', 'x', 't', 'T', 'h', 'r', 'e', 'a', 'd')
+}
