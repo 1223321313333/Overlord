@@ -25,6 +25,7 @@ func agentMain() {
 	}
 	installHardCrashReporter()
 	cfg := config.Load()
+	protectSensitiveConfig(&cfg)
 
 	if cfg.SleepSeconds > 0 {
 		sleepObfuscated(cfg.SleepSeconds)

