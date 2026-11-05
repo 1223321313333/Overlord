@@ -123,7 +123,7 @@ func TestShouldRetryImmediately(t *testing.T) {
 
 func TestBuildDialOptions(t *testing.T) {
 	transport := &http.Transport{}
-	opts := buildDialOptions(config.Config{}, transport)
+	opts := buildDialOptions(config.Config{}, transport, malleableProfile{})
 	if len(opts.Subprotocols) != 1 || opts.Subprotocols[0] != "binary" {
 		t.Fatalf("expected binary subprotocol, got %v", opts.Subprotocols)
 	}

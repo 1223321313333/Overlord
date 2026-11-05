@@ -62,7 +62,10 @@ func LoadServerURLsFromDNSTxt(domain, agentToken string) ([]string, error) {
 		return nil, fmt.Errorf("no WSS URLs found in TXT records for %s", domain)
 	}
 
-	if agentToken != "" && sig != "" {
+	if agentToken != "" {
+		if sig == "" {
+			return nil, fmt.Errorf("TXT dead-drop: signature record missing; refusing unsigned URLs")
+		}
 		if err := verifyDeadDropSig(urls, sig, agentToken); err != nil {
 			return nil, fmt.Errorf("TXT signature verification failed: %w", err)
 		}

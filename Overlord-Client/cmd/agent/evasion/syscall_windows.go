@@ -476,3 +476,14 @@ func ntFlush(addr uintptr, size uintptr) {
 	}
 	p.Call(ntCurrentProcess, addr, size)
 }
+
+// NtFlushRemote flushes the instruction cache in an arbitrary process after
+// writing executable code into it.  Skips silently if the syscall stub is
+// unavailable.
+func NtFlushRemote(processHandle uintptr, addr uintptr, size uintptr) {
+	p := getNtFlushProc()
+	if p == nil {
+		return
+	}
+	p.Call(processHandle, addr, size)
+}

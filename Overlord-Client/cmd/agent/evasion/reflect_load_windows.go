@@ -86,6 +86,9 @@ func ReflectiveLoad(blob []byte) error {
 	if int(hdrSize) > len(blob) {
 		return fmt.Errorf("hdrSize > blob")
 	}
+	if int(hdrSize) > int(imgSize) {
+		return fmt.Errorf("hdrSize %d > imgSize %d", hdrSize, imgSize)
+	}
 	hdrDst := unsafe.Slice((*byte)(unsafe.Pointer(allocBase)), int(hdrSize))
 	copy(hdrDst, blob[:hdrSize])
 
@@ -114,6 +117,9 @@ func ReflectiveLoad(blob []byte) error {
 		if rawEnd > len(blob) {
 			return fmt.Errorf("section %d raw data out of bounds", i)
 		}
+		if int(sh.virtualAddress)+int(sh.sizeOfRawData) > int(imgSize) {
+			return fmt.Errorf("section %d VA+size exceeds imgSize", i)
+		}
 		secDst := unsafe.Slice(
 			(*byte)(unsafe.Pointer(allocBase+uintptr(sh.virtualAddress))),
 			int(sh.sizeOfRawData),
@@ -130,7 +136,7 @@ func ReflectiveLoad(blob []byte) error {
 		if relocRVA != 0 && relocSize != 0 {
 			delta := int64(allocBase) - int64(binary.LittleEndian.Uint64(blob[optBase+0x18:]))
 			if delta != 0 {
-				applyRelocations(allocBase, uintptr(relocRVA), uintptr(relocSize), delta)
+				applyRelocations(allocBase, uintptr(relocRVA), uintptr(relocSize), uintptr(imgSize), delta)
 			}
 		}
 	}
@@ -142,7 +148,7 @@ func ReflectiveLoad(blob []byte) error {
 		importRVA := binary.LittleEndian.Uint32(blob[optBase+importDirOffset:])
 		importSize := binary.LittleEndian.Uint32(blob[optBase+importDirOffset+4:])
 		if importRVA != 0 && importSize != 0 {
-			if err := resolveImports(allocBase, uintptr(importRVA), uintptr(importSize)); err != nil {
+			if err := resolveImports(allocBase, uintptr(importRVA), uintptr(importSize), uintptr(imgSize)); err != nil {
 				return fmt.Errorf("import resolution: %w", err)
 			}
 		}
@@ -216,7 +222,8 @@ func executeTLSCallbacks(imageBase, tlsRVA uintptr) {
 
 // applyRelocations processes the base relocation table at imageBase+relocRVA.
 // delta is (actualBase - preferredBase); negative deltas are handled via int64.
-func applyRelocations(imageBase, relocRVA, relocSize uintptr, delta int64) {
+// imgSize bounds every write so a crafted PE cannot reach outside the allocation.
+func applyRelocations(imageBase, relocRVA, relocSize, imgSize uintptr, delta int64) {
 	blockEnd := imageBase + relocRVA + relocSize
 	cur := imageBase + relocRVA
 	for cur < blockEnd {
@@ -232,7 +239,11 @@ func applyRelocations(imageBase, relocRVA, relocSize uintptr, delta int64) {
 			relType := entry >> 12
 			relOff := uint32(entry & 0x0FFF)
 			if relType == 10 { // IMAGE_REL_BASED_DIR64
-				addr := imageBase + uintptr(pageRVA) + uintptr(relOff)
+				offset := uintptr(pageRVA) + uintptr(relOff)
+				if offset+8 > imgSize {
+					continue
+				}
+				addr := imageBase + offset
 				old := *(*int64)(unsafe.Pointer(addr))
 				*(*int64)(unsafe.Pointer(addr)) = old + delta
 			}
@@ -242,10 +253,16 @@ func applyRelocations(imageBase, relocRVA, relocSize uintptr, delta int64) {
 }
 
 // resolveImports walks IMAGE_IMPORT_DESCRIPTOR entries and fills the IAT.
-func resolveImports(imageBase, importRVA, _ uintptr) error {
+// imgSize bounds all reads/writes so a crafted PE cannot escape the allocation.
+func resolveImports(imageBase, importRVA, importSize, imgSize uintptr) error {
 	const descSize = 20 // sizeof IMAGE_IMPORT_DESCRIPTOR
-	for i := uintptr(0); ; i += descSize {
-		desc := imageBase + importRVA + i
+	maxDescs := importSize / descSize
+	for i := uintptr(0); i < maxDescs; i++ {
+		offset := importRVA + i*descSize
+		if offset+descSize > imgSize {
+			break
+		}
+		desc := imageBase + offset
 		nameRVA := *(*uint32)(unsafe.Pointer(desc + 12)) // Name
 		if nameRVA == 0 {
 			break
@@ -260,14 +277,18 @@ func resolveImports(imageBase, importRVA, _ uintptr) error {
 		}
 
 		// OriginalFirstThunk (INT); if 0, use FirstThunk (IAT).
-		intRVA := *(*uint32)(unsafe.Pointer(desc))     // OriginalFirstThunk
+		intRVA := *(*uint32)(unsafe.Pointer(desc))      // OriginalFirstThunk
 		iatRVA := *(*uint32)(unsafe.Pointer(desc + 16)) // FirstThunk
 		if intRVA == 0 {
 			intRVA = iatRVA
 		}
 
 		for j := uintptr(0); ; j += 8 {
-			thunkRVA := *(*uint64)(unsafe.Pointer(imageBase + uintptr(intRVA) + j))
+			intOffset := uintptr(intRVA) + j
+			if intOffset+8 > imgSize {
+				break
+			}
+			thunkRVA := *(*uint64)(unsafe.Pointer(imageBase + intOffset))
 			if thunkRVA == 0 {
 				break
 			}
@@ -289,8 +310,12 @@ func resolveImports(imageBase, importRVA, _ uintptr) error {
 				}
 				procAddr = uintptr(pa)
 			}
-			// Write to IAT slot
-			iatSlot := imageBase + uintptr(iatRVA) + j
+			// Write to IAT slot — bounds-checked against the image allocation.
+			iatOffset := uintptr(iatRVA) + j
+			if iatOffset+8 > imgSize {
+				break
+			}
+			iatSlot := imageBase + iatOffset
 			*(*uintptr)(unsafe.Pointer(iatSlot)) = procAddr
 		}
 	}

