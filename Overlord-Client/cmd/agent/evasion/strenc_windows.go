@@ -97,3 +97,15 @@ func sNtGetContextThread() string {
 func sNtSetContextThread() string {
 	return stackStr('N', 't', 'S', 'e', 't', 'C', 'o', 'n', 't', 'e', 'x', 't', 'T', 'h', 'r', 'e', 'a', 'd')
 }
+func sNtTraceEvent() string {
+	return stackStr('N', 't', 'T', 'r', 'a', 'c', 'e', 'E', 'v', 'e', 'n', 't')
+}
+func sNtTraceControl() string {
+	return stackStr('N', 't', 'T', 'r', 'a', 'c', 'e', 'C', 'o', 'n', 't', 'r', 'o', 'l')
+}
+func sAmsiInitialize() string {
+	return stackStr('A', 'm', 's', 'i', 'I', 'n', 'i', 't', 'i', 'a', 'l', 'i', 'z', 'e')
+}
+func sLdrUnloadDll() string {
+	return stackStr('L', 'd', 'r', 'U', 'n', 'l', 'o', 'a', 'd', 'D', 'l', 'l')
+}
