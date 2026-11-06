@@ -10,7 +10,7 @@ $outBinary = "agent_obf.exe"
 # Install garble if not present
 if (-not (Get-Command garble -ErrorAction SilentlyContinue)) {
     Write-Host "[*] garble not found, installing..."
-    go install mvdan.cc/garble@latest
+    go install mvdan.cc/garble@master
     if ($LASTEXITCODE -ne 0) { throw "garble install failed" }
 }
 
