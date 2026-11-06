@@ -7,6 +7,7 @@ import { metrics } from "./metrics";
 import { logAudit, AuditAction } from "./auditLog";
 import { sendPingRequest } from "./wsHandlers";
 import { CORS_HEADERS } from "./server/http-security";
+import { isSafeRemotePath } from "./server/file-transfer-state";
 
 const DEFAULT_PAGE_SIZE = 12;
 
@@ -74,6 +75,9 @@ export function handleCommand(target: ClientInfo, action: string, req: Request) 
 
   if (FILE_COMMANDS.has(action)) {
     const path = new URL(req.url).searchParams.get("path") || "";
+    if (!isSafeRemotePath(path)) {
+      return new Response("Bad request", { status: 400 });
+    }
     target.ws.send(encodeMessage({ type: "command", commandType: action as any, id: uuidv4(), payload: { path } }));
     return OK();
   }

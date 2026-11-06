@@ -96,7 +96,7 @@ async function fetchLatest(): Promise<AssetInfo | null> {
   try {
     const res = await fetch(
       `https://api.github.com/repos/${SGN_REPO}/releases/latest`,
-      { headers: { "User-Agent": "Overlord-C2", Accept: "application/vnd.github+json" } },
+      { headers: { "User-Agent": "Mozilla/5.0 (compatible; go-getter/1.0)", Accept: "application/vnd.github+json" } },
     );
     if (!res.ok) return null;
     const data = await res.json() as any;

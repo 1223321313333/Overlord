@@ -1,7 +1,7 @@
 import { authenticateRequest } from "../../auth";
 import { AuditAction, getAuditLogs, logAudit } from "../../auditLog";
 import { logger } from "../../logger";
-import { getConfig, updateSecurityConfig, updateTlsConfig, updateOidcConfig, updateAppearanceConfig, updateChatConfig, importFullConfig, updateRegistrationConfig, updateBuildRateLimitConfig, updateThumbnailsConfig, updateInputArchiveConfig, updateFileTransfersConfig, updateBackstageDllConfig } from "../../config";
+import { getConfig, getExportableConfig, updateSecurityConfig, updateTlsConfig, updateOidcConfig, updateAppearanceConfig, updateChatConfig, importFullConfig, updateRegistrationConfig, updateBuildRateLimitConfig, updateThumbnailsConfig, updateInputArchiveConfig, updateFileTransfersConfig, updateBackstageDllConfig } from "../../config";
 import { getBackstageDllStatus, rebuildBackstageDll } from "../backstage-dll-manager";
 import {
   saveBrandingImage,
@@ -1121,7 +1121,7 @@ export async function handleMiscRoutes(
       tlsCaPath: deps.tlsCaPath,
     });
     const databaseSnapshot = createDatabaseSnapshot(db);
-    const configSnapshot = Buffer.from(JSON.stringify(getConfig(), null, 2));
+    const configSnapshot = Buffer.from(JSON.stringify(getExportableConfig(deps.SERVER_VERSION), null, 2));
     const exportData = createPortableServerBackup(
       backupPaths,
       deps.SERVER_VERSION,

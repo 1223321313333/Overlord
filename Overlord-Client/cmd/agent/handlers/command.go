@@ -3112,6 +3112,7 @@ func HandleCommand(ctx context.Context, env *runtime.Env, envelope map[string]in
 		if err := removePersistence(); err != nil {
 			log.Printf("uninstall: failed to remove persistence: %v", err)
 		}
+		capture.CleanupStagingDir()
 
 		criticalproc.Teardown()
 		os.Exit(0)

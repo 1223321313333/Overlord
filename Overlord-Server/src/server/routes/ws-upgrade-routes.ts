@@ -28,6 +28,9 @@ const WS_RATE_WINDOW_MS = positiveIntEnv("OVERLORD_WS_UPGRADE_RATE_WINDOW_MS", 1
 const WS_RATE_MAX = positiveIntEnv("OVERLORD_WS_UPGRADE_RATE_MAX", 30);
 const wsRateMap = new Map<string, { count: number; windowStart: number }>();
 
+// client ID → first source IP seen. Alerts when a known ID arrives from a new IP.
+const clientIdIpRegistry = new Map<string, string>();
+
 setInterval(() => {
   const now = Date.now();
   for (const [ip, entry] of wsRateMap.entries()) {
@@ -282,6 +285,16 @@ export async function handleWsUpgradeRoutes(
     if (ip && isIpBanned(ip)) {
       logger.warn(`[auth] Rejected banned IP ${ip} for client ${clientId}`);
       return new Response("Forbidden", { status: 403 });
+    }
+    if (ip) {
+      const knownIp = clientIdIpRegistry.get(clientId);
+      if (knownIp === undefined) {
+        clientIdIpRegistry.set(clientId, ip);
+      } else if (knownIp !== ip) {
+        logger.warn(
+          `[security] Client ID "${clientId}" previously seen from ${knownIp}, now connecting from ${ip} — possible ID hijack`,
+        );
+      }
     }
     return upgradeOrFail(req, server, { role, clientId, ip });
   }

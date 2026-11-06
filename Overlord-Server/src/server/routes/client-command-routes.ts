@@ -286,7 +286,7 @@ export async function handleClientCommandRoute(
         return new Response("Forbidden", { status: 403 });
       }
 
-      const password = typeof body?.password === "string" ? body.password : "";
+      const password = typeof body?.password === "string" ? body.password.slice(0, 256) : "";
       const cmdId = uuidv4();
       const replyPromise: Promise<{ ok: boolean; message?: string }> = new Promise((resolve, reject) => {
         const timeout = setTimeout(() => {
@@ -298,7 +298,7 @@ export async function handleClientCommandRoute(
 
       target.ws.send(encodeMessage({ type: "command", commandType: "elevate", id: cmdId, payload: { password } }));
       metrics.recordCommand("elevate");
-      logAudit({ timestamp: Date.now(), username: user.username, ip, action: AuditAction.COMMAND, targetClientId: targetId, success: true, details: "elevate" });
+      logAudit({ timestamp: Date.now(), username: user.username, ip, action: AuditAction.COMMAND, targetClientId: targetId, success: true, details: JSON.stringify({ command: "elevate", hasCredential: password.length > 0 }) });
 
       try {
         const result = await replyPromise;

@@ -150,7 +150,10 @@ export function revokeToken(token: string): void {
     const parts = token.split(".");
     if (parts.length === 3) {
       const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString());
-      if (typeof payload.exp === "number") expiresAt = payload.exp;
+      if (typeof payload.exp === "number" && Number.isFinite(payload.exp)) {
+        const maxExp = Math.floor(Date.now() / 1000) + 7 * 24 * 3600;
+        expiresAt = Math.min(payload.exp, maxExp);
+      }
     }
   } catch { /* keep fallback */ }
 
@@ -217,7 +220,10 @@ export function extractTokenFromCookie(
 
   const cookies = cookieHeader.split(/;\s*/);
   for (const cookie of cookies) {
-    const [name, value] = cookie.split("=");
+    const eqIdx = cookie.indexOf("=");
+    if (eqIdx === -1) continue;
+    const name = cookie.slice(0, eqIdx);
+    const value = cookie.slice(eqIdx + 1);
     if (name === "overlord_token") {
       return value;
     }

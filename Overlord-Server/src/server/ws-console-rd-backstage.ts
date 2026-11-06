@@ -33,6 +33,7 @@ import {
   startRemoteDesktopRecording,
   stopRemoteDesktopRecording,
 } from "./rd-recording";
+import { AuditAction, logAudit } from "../auditLog";
 
 function getVersionedInjectionDll(
   target: ClientInfo | undefined,
@@ -1732,6 +1733,15 @@ export function handleConsoleViewerMessage(ws: ServerWebSocket<SocketData>, raw:
     case "input": {
       const data = typeof payload.data === "string" ? payload.data : "";
       sendConsoleCommand(target, "console_input", { sessionId, data });
+      logAudit({
+        timestamp: Date.now(),
+        username: ws.data.username ?? "unknown",
+        ip: ws.data.ip ?? "unknown",
+        action: AuditAction.CONSOLE_INPUT,
+        targetClientId: clientId,
+        details: JSON.stringify({ sessionId, length: data.length }),
+        success: true,
+      });
       break;
     }
     case "resize": {

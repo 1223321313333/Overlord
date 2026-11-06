@@ -86,7 +86,7 @@ func getNtReadVirtualMemoryProc() *HGProc {
 
 func getNtQueryProcessProc() *HGProc {
 	hgNtQueryProcessOnce.Do(func() {
-		hgNtQueryProcessProc = NewHGProc("NtQueryInformationProcess")
+		hgNtQueryProcessProc = NewHGProc(sNtQueryInformationProcess())
 	})
 	return hgNtQueryProcessProc
 }

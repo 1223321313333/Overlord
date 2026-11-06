@@ -1,5 +1,8 @@
+import Database from "bun:sqlite";
+import { resolve } from "path";
 import { logger } from "./logger";
 import { getConfig } from "./config";
+import { ensureDataDir } from "./paths";
 
 interface RateLimitEntry {
   attempts: number;
@@ -13,7 +16,41 @@ type RequestRateLimitPolicy = {
   lockoutMs: number;
 };
 
-const rateLimitStore = new Map<string, RateLimitEntry>();
+const dataDir = ensureDataDir();
+const rlDb = new Database(resolve(dataDir, "overlord.db"));
+
+rlDb.run(`
+  CREATE TABLE IF NOT EXISTS rate_limits (
+    key TEXT PRIMARY KEY,
+    attempts INTEGER NOT NULL,
+    first_attempt INTEGER NOT NULL,
+    locked_until INTEGER
+  );
+`);
+
+function rlGet(key: string): RateLimitEntry | undefined {
+  const row = rlDb.query<{ attempts: number; first_attempt: number; locked_until: number | null }, [string]>(
+    "SELECT attempts, first_attempt, locked_until FROM rate_limits WHERE key = ?",
+  ).get(key);
+  if (!row) return undefined;
+  return {
+    attempts: row.attempts,
+    firstAttempt: row.first_attempt,
+    lockedUntil: row.locked_until ?? undefined,
+  };
+}
+
+function rlSet(key: string, entry: RateLimitEntry): void {
+  rlDb.run(
+    "INSERT OR REPLACE INTO rate_limits (key, attempts, first_attempt, locked_until) VALUES (?, ?, ?, ?)",
+    [key, entry.attempts, entry.firstAttempt, entry.lockedUntil ?? null],
+  );
+}
+
+function rlDelete(key: string): void {
+  rlDb.run("DELETE FROM rate_limits WHERE key = ?", [key]);
+}
+
 const requestRateLimitStore = new Map<string, RateLimitEntry>();
 
 const CLEANUP_INTERVAL = 60 * 1000;
@@ -36,7 +73,7 @@ export function isRateLimited(ip: string): {
   retryAfter?: number;
 } {
   const policy = getRateLimitPolicy();
-  const entry = rateLimitStore.get(ip);
+  const entry = rlGet(ip);
 
   if (!entry) {
     return { limited: false };
@@ -50,12 +87,13 @@ export function isRateLimited(ip: string): {
   }
 
   if (now - entry.firstAttempt > policy.windowMs) {
-    rateLimitStore.delete(ip);
+    rlDelete(ip);
     return { limited: false };
   }
 
   if (entry.attempts >= policy.maxAttempts) {
-    entry.lockedUntil = now + policy.lockoutMs;
+    const lockedUntil = now + policy.lockoutMs;
+    rlSet(ip, { ...entry, lockedUntil });
     const retryAfter = Math.ceil(policy.lockoutMs / 1000);
     logger.warn(
       `[rate-limit] IP ${ip} locked out for ${retryAfter}s after ${entry.attempts} failed attempts`,
@@ -69,32 +107,27 @@ export function isRateLimited(ip: string): {
 export function recordFailedAttempt(ip: string): void {
   const policy = getRateLimitPolicy();
   const now = Date.now();
-  const entry = rateLimitStore.get(ip);
+  const entry = rlGet(ip);
 
   if (!entry) {
-    rateLimitStore.set(ip, {
-      attempts: 1,
-      firstAttempt: now,
-    });
+    rlSet(ip, { attempts: 1, firstAttempt: now });
     return;
   }
 
   if (now - entry.firstAttempt > policy.windowMs) {
-    rateLimitStore.set(ip, {
-      attempts: 1,
-      firstAttempt: now,
-    });
+    rlSet(ip, { attempts: 1, firstAttempt: now });
     return;
   }
 
-  entry.attempts++;
+  const updated = { ...entry, attempts: entry.attempts + 1 };
+  rlSet(ip, updated);
   logger.debug(
-    `[rate-limit] IP ${ip} failed attempt ${entry.attempts}/${policy.maxAttempts}`,
+    `[rate-limit] IP ${ip} failed attempt ${updated.attempts}/${policy.maxAttempts}`,
   );
 }
 
 export function recordSuccessfulAttempt(ip: string): void {
-  rateLimitStore.delete(ip);
+  rlDelete(ip);
 }
 
 function makeRequestPolicy(prefix: string, defaults: RequestRateLimitPolicy): RequestRateLimitPolicy {
@@ -196,15 +229,12 @@ function cleanupExpired(): void {
   const now = Date.now();
   let cleaned = 0;
 
-  for (const [ip, entry] of rateLimitStore.entries()) {
-    const windowExpired = now - entry.firstAttempt > policy.windowMs;
-    const lockoutExpired = entry.lockedUntil && entry.lockedUntil < now;
-
-    if ((windowExpired && !entry.lockedUntil) || lockoutExpired) {
-      rateLimitStore.delete(ip);
-      cleaned++;
-    }
-  }
+  const windowThreshold = now - policy.windowMs;
+  const result = rlDb.run(
+    "DELETE FROM rate_limits WHERE (locked_until IS NULL AND first_attempt < ?) OR (locked_until IS NOT NULL AND locked_until < ?)",
+    [windowThreshold, now],
+  );
+  cleaned += result.changes;
 
   for (const [key, entry] of requestRateLimitStore.entries()) {
     const expired = now - entry.firstAttempt > 60 * 60 * 1000;
@@ -222,18 +252,9 @@ function cleanupExpired(): void {
 
 export function getRateLimitStats(): { total: number; locked: number } {
   const now = Date.now();
-  let locked = 0;
-
-  for (const entry of rateLimitStore.values()) {
-    if (entry.lockedUntil && entry.lockedUntil > now) {
-      locked++;
-    }
-  }
-
-  return {
-    total: rateLimitStore.size,
-    locked,
-  };
+  const total = (rlDb.query<{ c: number }, []>("SELECT COUNT(*) AS c FROM rate_limits").get()?.c) ?? 0;
+  const locked = (rlDb.query<{ c: number }, [number]>("SELECT COUNT(*) AS c FROM rate_limits WHERE locked_until > ?").get(now)?.c) ?? 0;
+  return { total, locked };
 }
 
 setInterval(cleanupExpired, CLEANUP_INTERVAL);

